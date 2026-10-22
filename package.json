@@ -1,0 +1,37 @@
+{
+  "name": "agent-onebot-inbox",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-account OneBot inbox and agent communication layer",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": { "aoi": "dist/cli.js" },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "test": "tsx --test tests/*.test.ts",
+    "migrate": "tsx src/migrate.ts",
+    "aoi": "tsx src/cli.ts",
+    "mcp": "tsx src/mcp-main.ts", "mcp:http": "tsx src/mcp-http.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@fastify/websocket": "^11.2.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "fastify": "^5.12.5",
+    "pg": "^8.16.3",
+    "ws": "^8.21.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/pg": "^8.15.5",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

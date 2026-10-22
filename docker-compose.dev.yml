@@ -1,0 +1,12 @@
+# Local development defaults; do not reuse secrets in production.
+services:
+  agent-onebot-inbox:
+    environment:
+      DATABASE_URL: postgres://aoi:${POSTGRES_PASSWORD:-aoi-local}@postgres:5432/aoi
+      API_TOKEN: ${API_TOKEN:-local-change-me}
+      HOST: 0.0.0.0
+      PORT: 8080
+      ACCOUNTS_JSON: ${ACCOUNTS_JSON:-[]}
+      PERMISSIONS_DEFAULT: readonly
+      LOG_MESSAGE_CONTENT: "false"
+      MAX_MESSAGE_BYTES: 262144
