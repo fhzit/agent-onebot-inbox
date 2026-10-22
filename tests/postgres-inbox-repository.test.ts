@@ -25,7 +25,7 @@ test('Postgres inbox query uses parameterized filters and paginates result', asy
 
 test('Postgres conversation context is scoped to the target account and conversation', async () => {
  const calls: { text: string; values?: unknown[] }[] = [];
- const db: SqlClient = { async query(text, values) { calls.push({ text, values }); return text.startsWith('SELECT id, account_id') ? { rows: [{ ...message, id: message.id, account_id: 'main', conversation_id: 'c1', provider_id: null, transport_id: null, direction: 'incoming', sent_at: new Date(), received_at: new Date(), deadline: null, raw_message: 'hello', at_users: [], raw_event: {} }] } : text.includes('ORDER BY m.sent_at') ? { rows: [] } : { rows: [] }; } };
+ const db: SqlClient = { async query(text, values) { calls.push({ text, values }); return text.includes('WHERE m.id=$1') ? { rows: [{ ...message, id: message.id, account_id: 'main', conversation_id: 'c1', conversation_type:'private', provider_id: null, transport_id: null, direction: 'incoming', sent_at: new Date(), received_at: new Date(), deadline: null, raw_message: 'hello', at_users: [], raw_event: {} }] } : text.includes('ORDER BY m.sent_at') ? { rows: [] } : { rows: [] }; } };
  await new PostgresMessageStore(db).context(message.id, 4, 2);
  assert.deepEqual(calls[0]!.values, [message.id]);
  assert.match(calls[1]!.text, /conversation_id/);

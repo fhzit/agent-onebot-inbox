@@ -11,12 +11,14 @@ ALTER TABLE message_actions DROP CONSTRAINT message_actions_account_id_fkey;
 ALTER TABLE audit_logs DROP CONSTRAINT audit_logs_account_id_fkey;
 ALTER TABLE provider_cursors DROP CONSTRAINT provider_cursors_account_id_fkey;
 ALTER TABLE reconciliation_gaps DROP CONSTRAINT reconciliation_gaps_account_id_fkey;
+ALTER TABLE system_events DROP CONSTRAINT system_events_account_id_fkey;
 
 ALTER TABLE messages DROP CONSTRAINT messages_conversation_id_fkey;
 ALTER TABLE group_members DROP CONSTRAINT group_members_conversation_id_fkey;
 ALTER TABLE audit_logs DROP CONSTRAINT audit_logs_conversation_id_fkey;
 ALTER TABLE provider_cursors DROP CONSTRAINT provider_cursors_conversation_id_fkey;
-ALTER TABLE messages DROP CONSTRAINT messages_id_fkey;
+ALTER TABLE classifications DROP CONSTRAINT classifications_conversation_id_fkey;
+ALTER TABLE messages DROP CONSTRAINT messages_reply_to_message_id_fkey;
 ALTER TABLE inbox_states DROP CONSTRAINT inbox_states_message_id_fkey;
 ALTER TABLE message_segments DROP CONSTRAINT message_segments_message_id_fkey;
 ALTER TABLE attachments DROP CONSTRAINT attachments_message_id_fkey;
@@ -39,12 +41,14 @@ ALTER TABLE message_actions ALTER COLUMN account_id TYPE text USING account_id::
 ALTER TABLE audit_logs ALTER COLUMN account_id TYPE text USING account_id::text;
 ALTER TABLE provider_cursors ALTER COLUMN account_id TYPE text USING account_id::text;
 ALTER TABLE reconciliation_gaps ALTER COLUMN account_id TYPE text USING account_id::text;
+ALTER TABLE system_events ALTER COLUMN account_id TYPE text USING account_id::text;
 
 ALTER TABLE conversations ALTER COLUMN id TYPE text USING id::text;
 ALTER TABLE messages ALTER COLUMN conversation_id TYPE text USING conversation_id::text;
 ALTER TABLE group_members ALTER COLUMN conversation_id TYPE text USING conversation_id::text;
 ALTER TABLE audit_logs ALTER COLUMN conversation_id TYPE text USING conversation_id::text;
 ALTER TABLE provider_cursors ALTER COLUMN conversation_id TYPE text USING conversation_id::text;
+ALTER TABLE classifications ALTER COLUMN conversation_id TYPE text USING conversation_id::text;
 ALTER TABLE messages ALTER COLUMN id TYPE text USING id::text;
 ALTER TABLE inbox_states ALTER COLUMN message_id TYPE text USING message_id::text;
 ALTER TABLE message_segments ALTER COLUMN message_id TYPE text USING message_id::text;
@@ -68,10 +72,12 @@ ALTER TABLE message_actions ADD CONSTRAINT message_actions_account_id_fkey FOREI
 ALTER TABLE audit_logs ADD CONSTRAINT audit_logs_account_id_fkey FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE RESTRICT;
 ALTER TABLE provider_cursors ADD CONSTRAINT provider_cursors_account_id_fkey FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE;
 ALTER TABLE reconciliation_gaps ADD CONSTRAINT reconciliation_gaps_account_id_fkey FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE RESTRICT;
+ALTER TABLE system_events ADD CONSTRAINT system_events_account_id_fkey FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE SET NULL;
 ALTER TABLE messages ADD CONSTRAINT messages_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT;
 ALTER TABLE group_members ADD CONSTRAINT group_members_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE;
 ALTER TABLE audit_logs ADD CONSTRAINT audit_logs_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT;
 ALTER TABLE provider_cursors ADD CONSTRAINT provider_cursors_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE;
+ALTER TABLE classifications ADD CONSTRAINT classifications_conversation_id_fkey FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT;
 ALTER TABLE inbox_states ADD CONSTRAINT inbox_states_message_id_fkey FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE;
 ALTER TABLE message_segments ADD CONSTRAINT message_segments_message_id_fkey FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE;
 ALTER TABLE attachments ADD CONSTRAINT attachments_message_id_fkey FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE RESTRICT;
