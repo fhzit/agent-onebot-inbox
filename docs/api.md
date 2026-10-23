@@ -15,6 +15,12 @@ All request bodies are JSON; errors use `{error:{code,message,retryable}}`.
 ## Management console
 
 The console also has a read-only audit-history table backed by authenticated `GET /api/admin/audit`. It displays only rows stored in the existing table; in-memory mode reports unavailable, and audit writes are not yet connected for every admin action.
+- `GET /api/admin/accounts`: authenticated; lists accounts with only `access_token_configured`, never token values.
+- `POST /api/admin/accounts`: authenticated; creates an account with `{id?,alias,self_id,provider,access_token,permission?,enabled?,action_url?}`. Token is write-only; PostgreSQL mode encrypts it with AES-256-GCM using runtime `ACCOUNT_ENCRYPTION_KEY` (base64 32 bytes). Memory mode loses it on restart. Provider is `napcat` or `snowluma`.
+- `PUT /api/admin/accounts/:id`: authenticated; updates account settings; omit `access_token` to keep the existing token.
+- `DELETE /api/admin/accounts/:id`: authenticated; removes account and its provider record; connected peer is closed. Existing message history may prevent deletion by database FK.
+- `GET /api/admin/priority`: authenticated; reads priority rules and watched people.
+- `POST|PUT|DELETE /api/admin/priority/rules[/:id]` and `/api/admin/priority/watch-people[/:id]`: authenticated CRUD; changes apply to newly received events immediately. PostgreSQL mode persists them; memory mode is volatile.
 - `POST /mcp`: Streamable HTTP MCP, API bearer token. Includes inbox read/search/context/status plus Agent state mark/dismiss tools.
 
 `message_id` accepts an integer JSON number or a base-10 integer string that fits signed int32; exponent, decimal, and out-of-range forms are rejected.

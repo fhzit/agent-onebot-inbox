@@ -13,6 +13,9 @@ import { Pool } from 'pg';
 import { PostgresMessageStore } from './postgres-store.js';
 import { classifyActionResponse, resolveReverseWsAccount } from './reverse-ws.js';
 import { applyPriority, type PriorityConfig } from './priority.js';
+import { MemoryPriorityStore, PostgresPriorityStore, type PriorityStore } from './priority-store.js';
+import { MemoryAccountStore, PostgresAccountStore, type AccountStore } from './account-store.js';
+import type { PriorityRule } from './priority.js';
 import { RuntimeOneBotService } from './runtime-onebot-service.js';
 import { adminPage } from './admin-page.js';
 
@@ -36,6 +39,37 @@ function respond(res: ServerResponse, code: number, body: unknown): void {
 }
 function safeTokenEqual(a:string,b:string):boolean{const l=createHmac('sha256','aoi').update(a).digest(),r=createHmac('sha256','aoi').update(b).digest();return timingSafeEqual(l,r);}
 function accountById(config:AppConfig,id:string):AccountConfig|undefined{return config.accounts.find(a=>a.id===id&&a.enabled);}
+type RuleRequest = { id?: unknown; kind?: unknown; weight?: unknown; priority?: unknown; keywords?: unknown; accountIds?: unknown; conversationTypes?: unknown; groupIds?: unknown; senderIds?: unknown; atMe?: unknown };
+function validateRule(input: RuleRequest): PriorityRule {
+  const id = typeof input.id === 'string' && input.id ? input.id : randomUUID();
+  const list = (value: unknown, valid: (entry: unknown) => boolean, field: string): string[] | undefined => {
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value) || value.length > 100 || !value.every(valid)) throw new Error(`Invalid ${field}`);
+    return [...new Set(value as string[])];
+  };
+  if (input.kind !== undefined && input.kind !== 'weighted' && input.kind !== 'hard') throw new Error('Invalid kind');
+  if (input.weight !== undefined && (typeof input.weight !== 'number' || !Number.isInteger(input.weight) || input.weight < -100 || input.weight > 100)) throw new Error('Invalid weight');
+  if (input.priority !== undefined && !['P0','P1','P2','P3','P4'].includes(String(input.priority))) throw new Error('Invalid priority');
+  if (input.atMe !== undefined && typeof input.atMe !== 'boolean') throw new Error('Invalid atMe');
+  const keywords=list(input.keywords,x=>typeof x==='string'&&x.length>0&&x.length<=100,'keywords');
+  const accountIds=list(input.accountIds,x=>typeof x==='string'&&Boolean(x),'accountIds');
+  const groupIds=list(input.groupIds,x=>typeof x==='string'&&Boolean(x),'groupIds');
+  const senderIds=list(input.senderIds,x=>typeof x==='string'&&Boolean(x),'senderIds');
+  const rawTypes=input.conversationTypes;
+  if(rawTypes!==undefined&&(!Array.isArray(rawTypes)||!rawTypes.every(x=>x==='private'||x==='group')))throw new Error('Invalid conversationTypes');
+  return {id,...(input.kind!==undefined?{kind:input.kind as 'weighted'|'hard'}:{}),...(input.weight!==undefined?{weight:input.weight as number}:{}),...(input.priority!==undefined?{priority:input.priority as NonNullable<PriorityRule['priority']>}:{}),...(keywords?{keywords}:{}),...(accountIds?{accountIds}:{}),...(groupIds?{groupIds}:{}),...(senderIds?{senderIds}:{}),...(rawTypes?{conversationTypes:rawTypes as NonNullable<PriorityRule['conversationTypes']>}:{}),...(input.atMe!==undefined?{atMe:input.atMe}:{} )};
+}
+function validateWatch(input: Record<string, unknown>): { id:string; userId:string; displayName:string; enabled:boolean; boost:number; accountIds?:string[] } {
+  const str=(v:unknown,max:number)=>typeof v==='string'&&v.trim().length>0&&v.length<=max;
+  if(input.id!==undefined&&!str(input.id,100))throw new Error('Invalid id');
+  if(!str(input.userId,100)||!str(input.displayName,120))throw new Error('userId and displayName are required');
+  if(typeof input.boost!=='number'||!Number.isInteger(input.boost)||input.boost<0||input.boost>100)throw new Error('boost must be 0..100');
+  if(input.enabled!==undefined&&typeof input.enabled!=='boolean')throw new Error('enabled must be boolean');
+  let accountIds: string[]|undefined;
+  if(input.accountIds!==undefined){if(!Array.isArray(input.accountIds)||input.accountIds.length>100||!input.accountIds.every(x=>typeof x==='string'&&x))throw new Error('Invalid accountIds');accountIds=[...new Set(input.accountIds as string[])];}
+  return {id:(input.id as string|undefined)??randomUUID(),userId:input.userId as string,displayName:input.displayName as string,enabled:(input.enabled as boolean|undefined)??true,boost:input.boost,...(accountIds?{accountIds}:{})};
+}
+
 function queryFilters(params: URLSearchParams): InboxQuery {
   const number = (name: string, fallback: number): number => { const raw=params.get(name); if(raw===null)return fallback; const n=Number(raw); if(!Number.isInteger(n)||n<0) throw new Error(`Invalid ${name}`); return n; };
   const type=params.get('type'); const priority=params.get('priority'); const at=params.get('at_me');
@@ -46,13 +80,17 @@ function queryFilters(params: URLSearchParams): InboxQuery {
   if(at!==null&&at!=='true'&&at!=='false')throw new Error('Invalid at_me');
   return {account_id:params.get('account_id')??undefined,type:type as InboxQuery['type']??undefined,sender:params.get('sender')??undefined,priority:priority as InboxQuery['priority']??undefined,at_me:at===null?undefined:at==='true',keyword:params.get('keyword')??undefined,since:params.get('since')??undefined,until:params.get('until')??undefined,offset:number('offset',0),limit:number('limit',50), ...(stateFilters[0]?{state:stateFilters[0]}:{}) };
 }
-export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string } = {}): Promise<Runtime> {
+export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string } = {}): Promise<Runtime> {
   if(options.requireDatabase&&!options.databaseUrl)throw new Error('DATABASE_URL is required for durable runtime');
   if (!config.apiToken) throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
   if (config.accounts.some(a => a.enabled && !a.access_token)) throw new Error('Every enabled account requires access_token');
   let pool:Pool|undefined; let runtimeStore:MessageStore|PostgresMessageStore=store??new MessageStore();
-  if(!store&&options.databaseUrl){pool=new Pool({connectionString:options.databaseUrl,max:10,connectionTimeoutMillis:5000});try{const migrationDir=path.join(path.dirname(fileURLToPath(import.meta.url)),'..','migrations');await pool.query('SELECT pg_advisory_lock($1)',[741029441]);try{await pool.query('CREATE TABLE IF NOT EXISTS schema_migrations(name text PRIMARY KEY,applied_at timestamptz NOT NULL DEFAULT now())');for(const file of(await readdir(migrationDir)).filter(name=>/^\d+_[a-z0-9_-]+\.sql$/.test(name)).sort()){const found=await pool.query('SELECT 1 FROM schema_migrations WHERE name=$1',[file]);if(!found.rowCount){await pool.query('BEGIN');try{await pool.query(await readFile(path.join(migrationDir,file),'utf8'));await pool.query('INSERT INTO schema_migrations(name) VALUES($1)',[file]);await pool.query('COMMIT');}catch(e){await pool.query('ROLLBACK');throw e;}}}for(const account of config.accounts)await pool.query('INSERT INTO accounts(id,alias,self_id,enabled) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET alias=EXCLUDED.alias,self_id=EXCLUDED.self_id,enabled=EXCLUDED.enabled',[account.id,account.alias,account.self_id,account.enabled]);}finally{await pool.query('SELECT pg_advisory_unlock($1)',[741029441]);}runtimeStore=PostgresMessageStore.fromPool(pool);}catch(e){await pool.end();throw e;}}
+  if(!store&&options.databaseUrl){pool=new Pool({connectionString:options.databaseUrl,max:10,connectionTimeoutMillis:5000});try{if(!options.accountEncryptionKey)throw new Error('ACCOUNT_ENCRYPTION_KEY is required for persistent account settings');const migrationDir=path.join(path.dirname(fileURLToPath(import.meta.url)),'..','migrations');await pool.query('SELECT pg_advisory_lock($1)',[741029441]);try{await pool.query('CREATE TABLE IF NOT EXISTS schema_migrations(name text PRIMARY KEY,applied_at timestamptz NOT NULL DEFAULT now())');for(const file of(await readdir(migrationDir)).filter(name=>/^\d+_[a-z0-9_-]+\.sql$/.test(name)).sort()){const found=await pool.query('SELECT 1 FROM schema_migrations WHERE name=$1',[file]);if(!found.rowCount){await pool.query('BEGIN');try{await pool.query(await readFile(path.join(migrationDir,file),'utf8'));await pool.query('INSERT INTO schema_migrations(name) VALUES($1)',[file]);await pool.query('COMMIT');}catch(e){await pool.query('ROLLBACK');throw e;}}}for(const account of config.accounts)await pool.query('INSERT INTO accounts(id,alias,self_id,enabled) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET alias=EXCLUDED.alias,self_id=EXCLUDED.self_id,enabled=EXCLUDED.enabled',[account.id,account.alias,account.self_id,account.enabled]);}finally{await pool.query('SELECT pg_advisory_unlock($1)',[741029441]);}runtimeStore=PostgresMessageStore.fromPool(pool);}catch(e){await pool.end();throw e;}}
   store=runtimeStore;
+  const priorityStore: PriorityStore = pool ? new PostgresPriorityStore(pool) : new MemoryPriorityStore();
+  const accountStore: AccountStore = pool ? new PostgresAccountStore(pool,options.accountEncryptionKey??'') : new MemoryAccountStore();
+  let activePriorityConfig = pool ? await priorityStore.list() : structuredClone(priorityConfig);
+  if(pool){const secrets=await (accountStore as PostgresAccountStore).loadSecrets();for(const account of config.accounts){const secret=secrets.get(account.id);if(!account.access_token&&secret)account.access_token=secret;}}else for(const account of config.accounts)await accountStore.create(account);
   if (!config.apiToken) throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
   if (config.accounts.some(a => a.enabled && !a.access_token)) throw new Error('Every enabled account requires access_token');
   const peers = new Map<string, Peer>();
@@ -81,7 +119,7 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
         if (!account.access_token || !safeTokenEqual(account.access_token, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Invalid transport token', retryable: false } });
         const event = await readBody(req, config.maxMessageBytes) as OneBotEvent;
         const normalized = normalizeEvent(account.id, account.provider, `http:${account.id}`, event);
-        const message = normalized ? applyPriority(normalized, priorityConfig) : null;
+        const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
         if (!message) return respond(res, 200, { status: 'ignored' });
         const result = await store.insert(message); eventCount++; if (!result.inserted) duplicateCount++;
         return respond(res, 200, { status: result.inserted ? 'stored' : 'duplicate', message_id: result.message.id });
@@ -98,14 +136,61 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
         const messages = await Promise.all(result.messages.map(async message => ({ ...message, state: await store.state(message.id) })));
         return respond(res, 200, { ...result, messages });
       }
-      if (req.method === 'GET' && url.pathname === '/api/admin/audit') {
-        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
-        const limitRaw=url.searchParams.get('limit'),offsetRaw=url.searchParams.get('offset');
-        const limit=limitRaw===null?50:Number(limitRaw),offset=offsetRaw===null?0:Number(offsetRaw);
-        if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0) return respond(res,400,{error:{code:'VALIDATION_ERROR',message:'Invalid audit pagination',retryable:false}});
-        if(!pool) return respond(res,503,{error:{code:'AUDIT_UNAVAILABLE',message:'Persistent audit is unavailable in memory mode',retryable:false}});
-        const result=await pool.query('SELECT id,actor,action,account_id,conversation_id,message_id,target_type,target_id,result,metadata,created_at FROM audit_logs ORDER BY created_at DESC,id DESC LIMIT $1 OFFSET $2',[limit,offset]);
+      const adminAccounts=url.pathname.match(/^\/api\/admin\/accounts(?:\/([^/]+))?$/);
+      if(adminAccounts){
+        if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+        const id=adminAccounts[1]?decodeURIComponent(adminAccounts[1]):undefined;
+        if(req.method==='GET')return respond(res,200,{accounts:await accountStore.list()});
+        if(req.method==='POST'||req.method==='PUT'){
+          try{
+            const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be an object');const value=body as Record<string,unknown>;
+            const accountId=id??(typeof value.id==='string'&&value.id?value.id:randomUUID());
+            for(const key of ['alias','self_id','provider'])if(typeof value[key]!=='string'||!(value[key] as string).trim())throw new Error(`${key} is required`);
+            const provider=String(value.provider);if(!['napcat','snowluma'].includes(provider))throw new Error('provider must be napcat or snowluma');
+            const permission=value.permission??'readonly';if(!['readonly','confirm','direct'].includes(String(permission)))throw new Error('Invalid permission');
+            if(value.enabled!==undefined&&typeof value.enabled!=='boolean')throw new Error('enabled must be boolean');
+            if(!id&&typeof value.access_token!=='string')throw new Error('access_token is required for new accounts');if(!id&&typeof value.access_token==='string'&&!value.access_token.trim())throw new Error('access_token is required for new accounts');
+            const old=config.accounts.find(a=>a.id===accountId);const secret=typeof value.access_token==='string'&&value.access_token?value.access_token:old?.access_token;
+            if(value.enabled!==false&&!secret)throw new Error('An enabled account requires access_token');
+            const account:AccountConfig={id:accountId,alias:(value.alias as string).trim(),self_id:(value.self_id as string).trim(),provider,enabled:value.enabled!==false,permission:permission as AccountConfig['permission'],...(secret?{access_token:secret}:{}),...(typeof value.action_url==='string'&&value.action_url?{action_url:value.action_url}:{})};
+            if(id){const updated=await accountStore.update(id,account);if(!updated)return respond(res,404,{error:{code:'NOT_FOUND',message:'Account not found',retryable:false}});const index=config.accounts.findIndex(a=>a.id===id);if(index>=0)config.accounts[index]=account;else config.accounts.push(account);}
+            else {await accountStore.create(account);config.accounts.push(account);}
+            return respond(res,id?200:201,{account:{id:account.id,alias:account.alias,self_id:account.self_id,provider:account.provider,enabled:account.enabled,permission:account.permission,access_token_configured:Boolean(secret),connected:false}});
+          }catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid account',retryable:false}});}
+        }
+        if(req.method==='DELETE'&&id){const removed=await accountStore.remove(id);if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Account not found',retryable:false}});const index=config.accounts.findIndex(a=>a.id===id);if(index>=0)config.accounts.splice(index,1);const peer=peers.get(id);if(peer){peer.socket.close();peers.delete(id);}return respond(res,200,{deleted:true});}
+      }
+        if (req.method === 'GET' && url.pathname === '/api/admin/priority') {
+          if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, {error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+          return respond(res,200,await priorityStore.list());
+        }
+        const rulePath=url.pathname.match(/^\/api\/admin\/priority\/rules(?:\/([^/]+))?$/);
+        if(rulePath){
+          if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+          if(req.method==='GET')return respond(res,200,{rules:(await priorityStore.list()).rules});
+          if(req.method==='POST'||req.method==='PUT'){
+            try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be an object');const input=body as RuleRequest;const idInPath=rulePath[1]?decodeURIComponent(rulePath[1]):undefined;const rule=validateRule({...input,...(idInPath?{id:idInPath}:{})});await priorityStore.putRule(rule);activePriorityConfig=await priorityStore.list();return respond(res,req.method==='POST'?201:200,{rule});}
+            catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid rule',retryable:false}});}
+          }
+          if(req.method==='DELETE'&&rulePath[1]){const removed=await priorityStore.deleteRule(decodeURIComponent(rulePath[1]));if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Rule not found',retryable:false}});activePriorityConfig=await priorityStore.list();return respond(res,200,{deleted:true});}
+        }
+        const watchPath=url.pathname.match(/^\/api\/admin\/priority\/watch-people(?:\/([^/]+))?$/);
+        if(watchPath){
+          if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+          if(req.method==='GET')return respond(res,200,{watchPeople:(await priorityStore.list()).watchPeople});
+          if(req.method==='POST'||req.method==='PUT'){
+            try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be an object');const item=validateWatch({...body as Record<string,unknown>,...(watchPath[1]?{id:decodeURIComponent(watchPath[1])}:{})});for(const id of item.accountIds??[])if(!config.accounts.some(a=>a.id===id))throw new Error('Unknown account scope');const saved={id:item.id,userId:item.userId,displayName:item.displayName,enabled:item.enabled,boost:item.boost,...(item.accountIds?{accountIds:item.accountIds}:{})};await priorityStore.putWatchPerson(saved);activePriorityConfig=await priorityStore.list();return respond(res,req.method==='POST'?201:200,{watchPerson:saved});}
+            catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid watch person',retryable:false}});}
+          }
+          if(req.method==='DELETE'&&watchPath[1]){const removed=await priorityStore.deleteWatchPerson(decodeURIComponent(watchPath[1]));if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Watch person not found',retryable:false}});activePriorityConfig=await priorityStore.list();return respond(res,200,{deleted:true});}
+        }
 
+      if (req.method === 'GET' && url.pathname === '/api/admin/audit') {
+        if (!safeTokenEqual(config.apiToken,bearer(req))) return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+        const limit=Number(url.searchParams.get('limit')??50),offset=Number(url.searchParams.get('offset')??0);
+        if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0)return respond(res,400,{error:{code:'VALIDATION_ERROR',message:'Invalid audit pagination',retryable:false}});
+        if(!pool)return respond(res,503,{error:{code:'AUDIT_UNAVAILABLE',message:'Persistent audit is unavailable in memory mode',retryable:false}});
+        const result=await pool.query('SELECT id,actor,action,account_id,conversation_id,message_id,target_type,target_id,result,metadata,created_at FROM audit_logs ORDER BY created_at DESC,id DESC LIMIT $1 OFFSET $2',[limit,offset]);
         return respond(res,200,{events:result.rows,limit,offset,has_more:result.rows.length===limit});
       }
       if (req.method === 'GET' && url.pathname === '/api/summary') {
@@ -215,7 +300,7 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
       const event = packet as OneBotEvent;
       if (String(event.self_id ?? account.self_id) !== account.self_id) { logger.warn({ account_id: account.id }, 'discarded mismatched self_id event'); return; }
       const normalized = normalizeEvent(account.id, account.provider, `reverse-ws:${account.id}`, event);
-      const message = normalized ? applyPriority(normalized, priorityConfig) : null;
+      const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
       if (!message) return;
       const result = await store.insert(message); eventCount++; if (!result.inserted) duplicateCount++;
     });

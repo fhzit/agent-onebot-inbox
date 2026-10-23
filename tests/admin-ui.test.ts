@@ -69,6 +69,10 @@ test('serves a local admin UI without embedding secrets or external assets', asy
     assert.match(html, /settingsAccounts/);
     assert.match(html, /API 地址/);
     assert.match(html, /settingsRefresh/);
+    assert.match(html, /accountCreateOpen/);
+    assert.match(html, /accountForm/);
+    assert.match(html, /ruleForm/);
+    assert.match(html, /watchForm/);
   } finally { await runtime.close(); }
 });
 

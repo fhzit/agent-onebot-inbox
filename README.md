@@ -107,11 +107,11 @@ npm run aoi -- search 报名 --account main
 
 ## Management console
 
-- The console includes Inbox, a runtime/settings view (service/database status and redacted account status), and a read-only audit-history table backed by authenticated `GET /api/admin/audit`. It displays only rows stored in the existing table; in-memory mode reports unavailable, and audit writes are not yet connected for every admin action.
-- The settings page intentionally does not edit secrets, account tokens, or database configuration; those remain host-managed. The UI keeps the API token in tab memory only.
+- The console includes Inbox, account management (authenticated create/update/delete with write-only transport tokens), persisted priority rules and watched people (when PostgreSQL is configured), runtime status, and a read-only audit-history table backed by authenticated `GET /api/admin/audit`.
+- Account token values are write-only and never returned by management APIs; PostgreSQL mode encrypts them with AES-256-GCM using the externally supplied `ACCOUNT_ENCRYPTION_KEY` (base64-encoded 32 bytes). Keep this key in the protected runtime environment and back it up separately; losing it makes stored account tokens unrecoverable. Memory mode is volatile. The admin UI keeps its API token in tab memory only. In-memory settings disappear on process restart.
 - The admin page build parses inline JavaScript with Node during typecheck/build; tests extract the served HTML and verify script syntax.
 
-This is not yet a full production administration suite: account CRUD/provider onboarding, token rotation, audit history, user/role management, backups, and direct QQ read are not provided in the web UI. Do not expose an API token to untrusted users. Status actions never mark messages read on QQ.
+This is still Alpha, not a production-ready administration suite: full provider onboarding and transport lifecycle, user/role management, backups/restore, full audit coverage, and direct QQ read are not provided in the web UI. Do not expose an API token to untrusted users. Status actions never mark messages read on QQ.
 
 
 The GitHub Actions workflow tests pull requests and builds the container image without publishing it. Pushes to `main` publish `ghcr.io/fhzit/agent-onebot-inbox:main`; version-tag pushes (`v*`) publish the corresponding version tag. The workflow also publishes branch/tag and `sha-...` tags for pushed refs. GHCR packages may initially be private: set package visibility to **Public** in the package's GitHub settings after its first successful push if unauthenticated pulls are intended. `GITHUB_TOKEN` can publish only with repository Actions package-write permission and package access; it does not make package visibility public automatically.
