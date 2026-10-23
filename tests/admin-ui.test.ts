@@ -64,6 +64,11 @@ test('serves a local admin UI without embedding secrets or external assets', asy
     assert.match(html, /auditRows/);
     assert.match(html, /loadAudit/);
     assert.match(html, /api\/admin\/audit/);
+    assert.match(html, /data-tab="settings"/);
+    assert.match(html, /settingsDatabase/);
+    assert.match(html, /settingsAccounts/);
+    assert.match(html, /API 地址/);
+    assert.match(html, /settingsRefresh/);
   } finally { await runtime.close(); }
 });
 

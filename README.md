@@ -107,8 +107,9 @@ npm run aoi -- search 报名 --account main
 
 ## Management console
 
-- The console also has a read-only audit-history table backed by authenticated `GET /api/admin/audit`. It displays only rows stored in the existing table; in-memory mode reports unavailable, and audit writes are not yet connected for every admin action.
-- The admin page build now parses the inline JavaScript with Node during both typecheck/build; a regression test extracts the served HTML and verifies script syntax.
+- The console includes Inbox, a runtime/settings view (service/database status and redacted account status), and a read-only audit-history table backed by authenticated `GET /api/admin/audit`. It displays only rows stored in the existing table; in-memory mode reports unavailable, and audit writes are not yet connected for every admin action.
+- The settings page intentionally does not edit secrets, account tokens, or database configuration; those remain host-managed. The UI keeps the API token in tab memory only.
+- The admin page build parses inline JavaScript with Node during typecheck/build; tests extract the served HTML and verify script syntax.
 
 This is not yet a full production administration suite: account CRUD/provider onboarding, token rotation, audit history, user/role management, backups, and direct QQ read are not provided in the web UI. Do not expose an API token to untrusted users. Status actions never mark messages read on QQ.
 
