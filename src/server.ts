@@ -96,8 +96,11 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
           const found=await pool.query('SELECT 1 FROM schema_migrations WHERE name=$1',[file]);
           if(!found.rowCount){await pool.query('BEGIN');try{await pool.query(await readFile(path.join(migrationDir,file),'utf8'));await pool.query('INSERT INTO schema_migrations(name) VALUES($1)',[file]);await pool.query('COMMIT');}catch(error){await pool.query('ROLLBACK');throw error;}}
         }
-        for(const account of config.accounts)await pool.query('INSERT INTO accounts(id,alias,self_id,enabled) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET alias=EXCLUDED.alias,self_id=EXCLUDED.self_id,enabled=EXCLUDED.enabled',[account.id,account.alias,account.self_id,account.enabled]);
       }finally{await pool.query('SELECT pg_advisory_unlock($1)',[741029441]);}
+      const managedAccounts=await new PostgresAccountStore(pool,options.accountEncryptionKey).loadConfiguredAccounts();
+      const managedIds=new Set(managedAccounts.map(account=>account.id));
+      config.accounts=[...config.accounts.filter(account=>!managedIds.has(account.id)),...managedAccounts];
+      for(const account of config.accounts)if(!managedIds.has(account.id))await new PostgresAccountStore(pool,options.accountEncryptionKey).create(account);
       runtimeStore=PostgresMessageStore.fromPool(pool);
     }catch(error){await pool.end();throw error;}
   }
@@ -105,7 +108,7 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   const priorityStore: PriorityStore = pool ? new PostgresPriorityStore(pool) : new MemoryPriorityStore();
   const accountStore: AccountStore = pool ? new PostgresAccountStore(pool,options.accountEncryptionKey??'') : new MemoryAccountStore();
   let activePriorityConfig = pool ? await priorityStore.list() : structuredClone(priorityConfig);
-  if(pool){const postgresAccounts=accountStore as PostgresAccountStore;const secrets=await postgresAccounts.loadSecrets();for(const account of config.accounts){const secret=secrets.get(account.id);if(!account.access_token&&secret)account.access_token=secret;await postgresAccounts.create(account);}}else for(const account of config.accounts)await accountStore.create(account);
+  if(!pool)for(const account of config.accounts)await accountStore.create(account);
   if (!config.apiToken) throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
   if (config.accounts.some(a => a.enabled && !a.access_token)) throw new Error('Every enabled account requires access_token');
   const peers = new Map<string, Peer>();
