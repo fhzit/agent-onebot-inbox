@@ -14,6 +14,7 @@ import { PostgresMessageStore } from './postgres-store.js';
 import { classifyActionResponse, resolveReverseWsAccount } from './reverse-ws.js';
 import { applyPriority, type PriorityConfig } from './priority.js';
 import { RuntimeOneBotService } from './runtime-onebot-service.js';
+import { adminPage } from './admin-page.js';
 
 export type Peer = { account: AccountConfig; socket: WebSocket; connectedAt: number; pending: Map<string, (value: unknown) => void> };
 export type Runtime = { close: () => Promise<void>; store: MessageStore | PostgresMessageStore; peers: Map<string, Peer>; accounts: AccountConfig[] };
@@ -38,10 +39,12 @@ function accountById(config:AppConfig,id:string):AccountConfig|undefined{return 
 function queryFilters(params: URLSearchParams): InboxQuery {
   const number = (name: string, fallback: number): number => { const raw=params.get(name); if(raw===null)return fallback; const n=Number(raw); if(!Number.isInteger(n)||n<0) throw new Error(`Invalid ${name}`); return n; };
   const type=params.get('type'); const priority=params.get('priority'); const at=params.get('at_me');
+  const stateKeys=['unread','processed','dismissed'] as const; const stateFilters=stateKeys.filter(key=>params.get(key)!==null);
+  if(stateFilters.length>1||stateFilters.some(key=>params.get(key)!=='true'))throw new Error('Invalid inbox state filter');
   if(type!==null&&type!=='private'&&type!=='group')throw new Error('Invalid type');
   if(priority!==null&&!['P0','P1','P2','P3','P4'].includes(priority))throw new Error('Invalid priority');
   if(at!==null&&at!=='true'&&at!=='false')throw new Error('Invalid at_me');
-  return {account_id:params.get('account_id')??undefined,type:type as InboxQuery['type']??undefined,sender:params.get('sender')??undefined,priority:priority as InboxQuery['priority']??undefined,at_me:at===null?undefined:at==='true',keyword:params.get('keyword')??undefined,since:params.get('since')??undefined,until:params.get('until')??undefined,offset:number('offset',0),limit:number('limit',50)};
+  return {account_id:params.get('account_id')??undefined,type:type as InboxQuery['type']??undefined,sender:params.get('sender')??undefined,priority:priority as InboxQuery['priority']??undefined,at_me:at===null?undefined:at==='true',keyword:params.get('keyword')??undefined,since:params.get('since')??undefined,until:params.get('until')??undefined,offset:number('offset',0),limit:number('limit',50), ...(stateFilters[0]?{state:stateFilters[0]}:{}) };
 }
 export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string } = {}): Promise<Runtime> {
   if(options.requireDatabase&&!options.databaseUrl)throw new Error('DATABASE_URL is required for durable runtime');
@@ -59,6 +62,12 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   const appHandler = async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     try {
+      if (req.method === 'GET' && (url.pathname === (config.adminBasePath ?? '/admin') || url.pathname === `${config.adminBasePath ?? '/admin'}/`)) {
+        const html = adminPage;
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'", 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' });
+        res.end(html);
+        return;
+      }
       if (req.method === 'GET' && url.pathname === '/health') return respond(res, 200, { status: 'ok' });
       if (req.method === 'GET' && url.pathname === '/ready') {
         const connected = [...peers.values()].filter(p => p.socket.readyState === WebSocket.OPEN).length;
@@ -85,13 +94,27 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
         if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const params = queryFilters(url.searchParams);
         if (params.account_id && !accountById(config, params.account_id)) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown account', retryable: false } });
-        return respond(res, 200, await store.query(params));
+        const result = await store.query(params);
+        const messages = await Promise.all(result.messages.map(async message => ({ ...message, state: await store.state(message.id) })));
+        return respond(res, 200, { ...result, messages });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/admin/audit') {
+        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        const limitRaw=url.searchParams.get('limit'),offsetRaw=url.searchParams.get('offset');
+        const limit=limitRaw===null?50:Number(limitRaw),offset=offsetRaw===null?0:Number(offsetRaw);
+        if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0) return respond(res,400,{error:{code:'VALIDATION_ERROR',message:'Invalid audit pagination',retryable:false}});
+        if(!pool) return respond(res,503,{error:{code:'AUDIT_UNAVAILABLE',message:'Persistent audit is unavailable in memory mode',retryable:false}});
+        const result=await pool.query('SELECT id,actor,action,account_id,conversation_id,message_id,target_type,target_id,result,metadata,created_at FROM audit_logs ORDER BY created_at DESC,id DESC LIMIT $1 OFFSET $2',[limit,offset]);
+
+        return respond(res,200,{events:result.rows,limit,offset,has_more:result.rows.length===limit});
       }
       if (req.method === 'GET' && url.pathname === '/api/summary') {
         if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const accountId = url.searchParams.get('account_id') ?? undefined;
         if (accountId && !accountById(config, accountId)) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown account', retryable: false } });
-        return respond(res, 200, await store.summary(accountId, url.searchParams.get('since') ?? undefined));
+        const summary = await store.summary(accountId, url.searchParams.get('since') ?? undefined);
+        const connections = [...peers.values()].map(peer => ({ account_id: peer.account.id, connected: peer.socket.readyState === WebSocket.OPEN, connected_at: new Date(peer.connectedAt).toISOString() }));
+        return respond(res, 200, { ...summary, accounts: config.accounts.map(({ access_token: _secret, ...account }) => ({ ...account, connected: connections.some(connection => connection.account_id === account.id && connection.connected) })), connections, uptime_seconds: Math.floor(process.uptime()), database: pool ? 'connected' : 'not_configured', counters: { ingested: eventCount, duplicates: duplicateCount, sends_succeeded: sendSuccess, sends_failed: sendFailure } });
       }
       if (req.method === 'POST' && (url.pathname === '/api/messages/mark_processed' || url.pathname === '/api/messages/dismiss')) {
         if (!config.apiToken || !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });

@@ -11,13 +11,13 @@
   "bin": { "aoi": "dist/cli.js" },
   "scripts": {
     "dev": "tsx watch src/main.ts",
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/embed-admin.mjs && tsc -p tsconfig.json",
     "start": "node dist/main.js",
     "test": "tsx --test tests/*.test.ts",
     "migrate": "tsx src/migrate.ts",
     "aoi": "tsx src/cli.ts",
     "mcp": "tsx src/mcp-main.ts", "mcp:http": "tsx src/mcp-http.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "node scripts/embed-admin.mjs && tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@fastify/websocket": "^11.2.0",

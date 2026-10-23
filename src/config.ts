@@ -16,6 +16,7 @@ export type AppConfig = {
   maxMessageBytes: number;
   logMessageContent: boolean;
   accounts: AccountConfig[];
+  adminBasePath: string;
 };
 
 function parseBool(value: string | undefined, fallback: boolean): boolean {
@@ -60,5 +61,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxMessageBytes: Number(env.MAX_MESSAGE_BYTES ?? 262144),
     logMessageContent: parseBool(env.LOG_MESSAGE_CONTENT, false),
     accounts,
+    adminBasePath: (() => { const value = (env.ADMIN_BASE_PATH ?? '/admin').replace(/\/$/, ''); if (!/^\/[a-zA-Z0-9/_-]*$/.test(value) || value === '/') throw new Error('ADMIN_BASE_PATH must be a non-root path'); return value; })(),
   };
 }

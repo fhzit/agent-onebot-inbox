@@ -105,7 +105,13 @@ npm run aoi -- search 报名 --account main
 
 当前 CLI 搜索仅在 API 返回的最多 200 条记录中做本地子串筛选；`unread` 命令当前不能视为可靠的持久未读过滤。不是 PostgreSQL 全文搜索。
 
-## Docker
+## Management console
+
+- The console also has a read-only audit-history table backed by authenticated `GET /api/admin/audit`. It displays only rows stored in the existing table; in-memory mode reports unavailable, and audit writes are not yet connected for every admin action.
+- The admin page build now parses the inline JavaScript with Node during both typecheck/build; a regression test extracts the served HTML and verifies script syntax.
+
+This is not yet a full production administration suite: account CRUD/provider onboarding, token rotation, audit history, user/role management, backups, and direct QQ read are not provided in the web UI. Do not expose an API token to untrusted users. Status actions never mark messages read on QQ.
+
 
 The GitHub Actions workflow tests pull requests and builds the container image without publishing it. Pushes to `main` publish `ghcr.io/fhzit/agent-onebot-inbox:main`; version-tag pushes (`v*`) publish the corresponding version tag. The workflow also publishes branch/tag and `sha-...` tags for pushed refs. GHCR packages may initially be private: set package visibility to **Public** in the package's GitHub settings after its first successful push if unauthenticated pulls are intended. `GITHUB_TOKEN` can publish only with repository Actions package-write permission and package access; it does not make package visibility public automatically.
 

@@ -1,7 +1,7 @@
 import type { NormalizedMessage } from './normalize.js';
 
 export interface InboxQuery {
-  account_id?: string | undefined; type?: 'private' | 'group' | undefined; sender?: string | undefined; priority?: NormalizedMessage['priority'] | undefined; at_me?: boolean | undefined; keyword?: string | undefined; since?: string | undefined; until?: string | undefined; offset?: number | undefined; limit?: number | undefined;
+  account_id?: string | undefined; type?: 'private' | 'group' | undefined; sender?: string | undefined; priority?: NormalizedMessage['priority'] | undefined; at_me?: boolean | undefined; keyword?: string | undefined; since?: string | undefined; until?: string | undefined; offset?: number | undefined; limit?: number | undefined; state?: 'unread'|'processed'|'dismissed'|undefined;
 }
 export interface InboxQueryResult { messages: NormalizedMessage[]; total: number; offset: number; limit: number; has_more: boolean; }
 
@@ -74,6 +74,7 @@ export class MessageStore {
       (!filters.sender || m.sender_id === filters.sender || m.sender_name?.toLocaleLowerCase() === filters.sender.toLocaleLowerCase() || m.sender_card?.toLocaleLowerCase() === filters.sender.toLocaleLowerCase()) &&
       (!filters.priority || m.priority === filters.priority) &&
       (filters.at_me === undefined || m.at_me === filters.at_me) &&
+      (filters.state === undefined || (filters.state === 'unread' ? (m.direction === 'incoming' && this.state(m.id)?.unread === true) : this.state(m.id)?.[filters.state] === true)) &&
       (!keyword || m.plain_text.toLocaleLowerCase().includes(keyword)) &&
       (!filters.since || m.sent_at >= filters.since) && (!filters.until || m.sent_at <= filters.until)
     ).sort((a, b) => b.sent_at.localeCompare(a.sent_at) || b.id.localeCompare(a.id));
@@ -83,10 +84,10 @@ export class MessageStore {
     return [...this.#byId.values()].filter(m => !accountId || m.account_id === accountId)
       .sort((a, b) => b.sent_at.localeCompare(a.sent_at)).slice(0, Math.max(1, Math.min(limit, 200)));
   }
-  summary(accountId?: string, since?: string): { count: number; by_account: Record<string, number>; messages: NormalizedMessage[] } {
+  summary(accountId?: string, since?: string): { count: number; unread: number; high_priority: number; by_account: Record<string, number>; messages: NormalizedMessage[] } {
     const messages = [...this.#byId.values()].filter(m => (!accountId || m.account_id === accountId) && (!since || m.sent_at >= since));
     const by_account: Record<string, number> = {};
     for (const message of messages) by_account[message.account_id] = (by_account[message.account_id] ?? 0) + 1;
-    return { count: messages.length, by_account, messages: messages.sort((a,b) => b.sent_at.localeCompare(a.sent_at)).slice(0,50) };
+    return { count: messages.length, unread: messages.filter(m=>m.direction==='incoming'&&this.state(m.id)?.unread).length, high_priority: messages.filter(m=>m.priority==='P0'||m.priority==='P1').length, by_account, messages: messages.sort((a,b)=>b.sent_at.localeCompare(a.sent_at)).slice(0,50) };
   }
 }
