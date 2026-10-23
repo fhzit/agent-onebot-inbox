@@ -82,15 +82,30 @@ function queryFilters(params: URLSearchParams): InboxQuery {
 }
 export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string } = {}): Promise<Runtime> {
   if(options.requireDatabase&&!options.databaseUrl)throw new Error('DATABASE_URL is required for durable runtime');
-  if (!config.apiToken) throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
-  if (config.accounts.some(a => a.enabled && !a.access_token)) throw new Error('Every enabled account requires access_token');
-  let pool:Pool|undefined; let runtimeStore:MessageStore|PostgresMessageStore=store??new MessageStore();
-  if(!store&&options.databaseUrl){pool=new Pool({connectionString:options.databaseUrl,max:10,connectionTimeoutMillis:5000});try{if(!options.accountEncryptionKey)throw new Error('ACCOUNT_ENCRYPTION_KEY is required for persistent account settings');const migrationDir=path.join(path.dirname(fileURLToPath(import.meta.url)),'..','migrations');await pool.query('SELECT pg_advisory_lock($1)',[741029441]);try{await pool.query('CREATE TABLE IF NOT EXISTS schema_migrations(name text PRIMARY KEY,applied_at timestamptz NOT NULL DEFAULT now())');for(const file of(await readdir(migrationDir)).filter(name=>/^\d+_[a-z0-9_-]+\.sql$/.test(name)).sort()){const found=await pool.query('SELECT 1 FROM schema_migrations WHERE name=$1',[file]);if(!found.rowCount){await pool.query('BEGIN');try{await pool.query(await readFile(path.join(migrationDir,file),'utf8'));await pool.query('INSERT INTO schema_migrations(name) VALUES($1)',[file]);await pool.query('COMMIT');}catch(e){await pool.query('ROLLBACK');throw e;}}}for(const account of config.accounts)await pool.query('INSERT INTO accounts(id,alias,self_id,enabled) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET alias=EXCLUDED.alias,self_id=EXCLUDED.self_id,enabled=EXCLUDED.enabled',[account.id,account.alias,account.self_id,account.enabled]);}finally{await pool.query('SELECT pg_advisory_unlock($1)',[741029441]);}runtimeStore=PostgresMessageStore.fromPool(pool);}catch(e){await pool.end();throw e;}}
+  if(!config.apiToken)throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
+  let pool:Pool|undefined;let runtimeStore:MessageStore|PostgresMessageStore=store??new MessageStore();
+  if(!store&&options.databaseUrl){
+    if(!options.accountEncryptionKey)throw new Error('ACCOUNT_ENCRYPTION_KEY is required for persistent account settings');
+    pool=new Pool({connectionString:options.databaseUrl,max:10,connectionTimeoutMillis:5000});
+    try{
+      const migrationDir=path.join(path.dirname(fileURLToPath(import.meta.url)),'..','migrations');
+      await pool.query('SELECT pg_advisory_lock($1)',[741029441]);
+      try{
+        await pool.query('CREATE TABLE IF NOT EXISTS schema_migrations(name text PRIMARY KEY,applied_at timestamptz NOT NULL DEFAULT now())');
+        for(const file of(await readdir(migrationDir)).filter(name=>/^\d+_[a-z0-9_-]+\.sql$/.test(name)).sort()){
+          const found=await pool.query('SELECT 1 FROM schema_migrations WHERE name=$1',[file]);
+          if(!found.rowCount){await pool.query('BEGIN');try{await pool.query(await readFile(path.join(migrationDir,file),'utf8'));await pool.query('INSERT INTO schema_migrations(name) VALUES($1)',[file]);await pool.query('COMMIT');}catch(error){await pool.query('ROLLBACK');throw error;}}
+        }
+        for(const account of config.accounts)await pool.query('INSERT INTO accounts(id,alias,self_id,enabled) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET alias=EXCLUDED.alias,self_id=EXCLUDED.self_id,enabled=EXCLUDED.enabled',[account.id,account.alias,account.self_id,account.enabled]);
+      }finally{await pool.query('SELECT pg_advisory_unlock($1)',[741029441]);}
+      runtimeStore=PostgresMessageStore.fromPool(pool);
+    }catch(error){await pool.end();throw error;}
+  }
   store=runtimeStore;
   const priorityStore: PriorityStore = pool ? new PostgresPriorityStore(pool) : new MemoryPriorityStore();
   const accountStore: AccountStore = pool ? new PostgresAccountStore(pool,options.accountEncryptionKey??'') : new MemoryAccountStore();
   let activePriorityConfig = pool ? await priorityStore.list() : structuredClone(priorityConfig);
-  if(pool){const secrets=await (accountStore as PostgresAccountStore).loadSecrets();for(const account of config.accounts){const secret=secrets.get(account.id);if(!account.access_token&&secret)account.access_token=secret;}}else for(const account of config.accounts)await accountStore.create(account);
+  if(pool){const postgresAccounts=accountStore as PostgresAccountStore;const secrets=await postgresAccounts.loadSecrets();for(const account of config.accounts){const secret=secrets.get(account.id);if(!account.access_token&&secret)account.access_token=secret;await postgresAccounts.create(account);}}else for(const account of config.accounts)await accountStore.create(account);
   if (!config.apiToken) throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
   if (config.accounts.some(a => a.enabled && !a.access_token)) throw new Error('Every enabled account requires access_token');
   const peers = new Map<string, Peer>();
