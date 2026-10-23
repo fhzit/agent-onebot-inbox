@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { readFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { startServer } from '../src/server.js';
 
 const account = { id: 'main', alias: 'Main', self_id: '10001', provider: 'napcat', enabled: true, access_token: 'transport-secret', permission: 'direct' as const };
@@ -10,10 +12,13 @@ test('admin embedded script parses successfully', async () => {
   const script = adminPage.slice(adminPage.indexOf('<script>') + 8, adminPage.indexOf('</script>'));
   const { writeFile } = await import('node:fs/promises');
   const { spawnSync } = await import('node:child_process');
-  const file = `/opt/data/cache/scratch/admin-script-${process.pid}.js`;
-  await writeFile(file, script);
-  const check = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
-  assert.equal(check.status, 0, check.stderr);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'aoi-admin-js-'));
+  const file = path.join(tempDir, 'inline.js');
+  try {
+    await writeFile(file, script);
+    const check = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
+    assert.equal(check.status, 0, check.stderr);
+  } finally { await rm(tempDir, { recursive: true, force: true }); }
 });
 
 test('admin audit endpoint rejects unauthenticated, invalid pagination, and reports unavailable persistent storage',async()=>{
@@ -49,10 +54,13 @@ test('serves a local admin UI without embedding secrets or external assets', asy
     assert.ok(script.length > 1000);
     const { writeFile } = await import('node:fs/promises');
     const { spawnSync } = await import('node:child_process');
-    const path = `/opt/data/cache/scratch/admin-ui-${process.pid}.js`;
-    await writeFile(path, script);
-    const checked = spawnSync(process.execPath, ['--check', path], { encoding: 'utf8' });
-    assert.equal(checked.status, 0, checked.stderr);
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'aoi-admin-ui-'));
+    const scriptPath = path.join(tempDir, 'inline.js');
+    try {
+      await writeFile(scriptPath, script);
+      const checked = spawnSync(process.execPath, ['--check', scriptPath], { encoding: 'utf8' });
+      assert.equal(checked.status, 0, checked.stderr);
+    } finally { await rm(tempDir, { recursive: true, force: true }); }
     assert.match(html, /auditRows/);
     assert.match(html, /loadAudit/);
     assert.match(html, /api\/admin\/audit/);
