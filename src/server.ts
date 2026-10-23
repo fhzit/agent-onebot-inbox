@@ -97,10 +97,11 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
           if(!found.rowCount){await pool.query('BEGIN');try{await pool.query(await readFile(path.join(migrationDir,file),'utf8'));await pool.query('INSERT INTO schema_migrations(name) VALUES($1)',[file]);await pool.query('COMMIT');}catch(error){await pool.query('ROLLBACK');throw error;}}
         }
       }finally{await pool.query('SELECT pg_advisory_unlock($1)',[741029441]);}
-      const managedAccounts=await new PostgresAccountStore(pool,options.accountEncryptionKey).loadConfiguredAccounts();
+      const postgresAccountStore=new PostgresAccountStore(pool,options.accountEncryptionKey);
+      const managedAccounts=await postgresAccountStore.loadConfiguredAccounts();
       const managedIds=new Set(managedAccounts.map(account=>account.id));
       config.accounts=[...config.accounts.filter(account=>!managedIds.has(account.id)),...managedAccounts];
-      for(const account of config.accounts)if(!managedIds.has(account.id))await new PostgresAccountStore(pool,options.accountEncryptionKey).create(account);
+      for(const account of config.accounts)if(!managedIds.has(account.id))await postgresAccountStore.create(account);
       runtimeStore=PostgresMessageStore.fromPool(pool);
     }catch(error){await pool.end();throw error;}
   }
