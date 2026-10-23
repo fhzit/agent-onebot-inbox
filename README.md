@@ -108,6 +108,7 @@ npm run aoi -- search 报名 --account main
 ## Management console
 
 - The console includes Inbox, account management (authenticated create/update/delete with write-only transport tokens), persisted priority rules and watched people (when PostgreSQL is configured), runtime status, and a read-only audit-history table backed by authenticated `GET /api/admin/audit`.
+- Notification settings support a Hermes Generic V2 webhook, priority threshold, optional message preview, timeout/retry bounds, and a test action. Secrets are encrypted with the runtime `ACCOUNT_ENCRYPTION_KEY`; delivery uses bounded synchronous retries and is best-effort (the durable queue/delivery ledger is not wired yet).
 - Account token values are write-only and never returned by management APIs; PostgreSQL mode encrypts them with AES-256-GCM using the externally supplied `ACCOUNT_ENCRYPTION_KEY` (base64-encoded 32 bytes). Keep this key in the protected runtime environment and back it up separately; losing it makes stored account tokens unrecoverable. Memory mode is volatile. The admin UI keeps its API token in tab memory only. In-memory settings disappear on process restart.
 - The admin page build parses inline JavaScript with Node during typecheck/build; tests extract the served HTML and verify script syntax.
 

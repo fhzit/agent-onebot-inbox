@@ -16,6 +16,8 @@ import { applyPriority, type PriorityConfig } from './priority.js';
 import { MemoryPriorityStore, PostgresPriorityStore, type PriorityStore } from './priority-store.js';
 import { MemoryAccountStore, PostgresAccountStore, type AccountStore } from './account-store.js';
 import type { PriorityRule } from './priority.js';
+import { HermesWebhookNotifier, type AgentNotification } from './agent-notifier.js';
+import { MemoryNotificationConfigStore, PostgresNotificationConfigStore, type NotificationConfigStore } from './notification-settings.js';
 import { RuntimeOneBotService } from './runtime-onebot-service.js';
 import { adminPage } from './admin-page.js';
 
@@ -39,6 +41,11 @@ function respond(res: ServerResponse, code: number, body: unknown): void {
 }
 function safeTokenEqual(a:string,b:string):boolean{const l=createHmac('sha256','aoi').update(a).digest(),r=createHmac('sha256','aoi').update(b).digest();return timingSafeEqual(l,r);}
 function accountById(config:AppConfig,id:string):AccountConfig|undefined{return config.accounts.find(a=>a.id===id&&a.enabled);}
+function accountsById(config:AppConfig,id:string):AccountConfig|undefined{return config.accounts.find(account=>account.id===id);}
+async function dispatchNotification(store:NotificationConfigStore,message:NormalizedMessage,account:AccountConfig|undefined):Promise<void>{
+  try{const settings=await store.get();if(!settings.enabled||!settings.webhookUrl||!settings.webhookSecret||!account)return;const levels=['P0','P1','P2','P3','P4'];if(levels.indexOf(message.priority)>levels.indexOf(settings.minPriority))return;const preview=settings.includePreview?message.plain_text.slice(0,240):'';const notifier=new HermesWebhookNotifier({url:settings.webhookUrl,secret:settings.webhookSecret,timeoutMs:settings.timeoutMs});const event:AgentNotification={event:'message.received',account:account.alias,message_id:message.id,priority:message.priority,sender:message.sender_name??message.sender_id,conversation:message.conversation_id,preview,reason:'Inbound message priority threshold matched'};let last:unknown;for(let attempt=0;attempt<settings.maxAttempts;attempt++){try{await notifier.notify(event);return;}catch(error){last=error;}}throw last instanceof Error?last:new Error('Webhook failed');}catch(error){logger.warn({error:error instanceof Error?error.message:'unknown'},'notification delivery failed');}
+}
+
 type RuleRequest = { id?: unknown; kind?: unknown; weight?: unknown; priority?: unknown; keywords?: unknown; accountIds?: unknown; conversationTypes?: unknown; groupIds?: unknown; senderIds?: unknown; atMe?: unknown };
 function validateRule(input: RuleRequest): PriorityRule {
   const id = typeof input.id === 'string' && input.id ? input.id : randomUUID();
@@ -108,6 +115,7 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   store=runtimeStore;
   const priorityStore: PriorityStore = pool ? new PostgresPriorityStore(pool) : new MemoryPriorityStore();
   const accountStore: AccountStore = pool ? new PostgresAccountStore(pool,options.accountEncryptionKey??'') : new MemoryAccountStore();
+  const notificationStore: NotificationConfigStore = pool ? new PostgresNotificationConfigStore(pool,options.accountEncryptionKey??'') : new MemoryNotificationConfigStore();
   let activePriorityConfig = pool ? await priorityStore.list() : structuredClone(priorityConfig);
   if(!pool)for(const account of config.accounts)await accountStore.create(account);
   if (!config.apiToken) throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
@@ -141,6 +149,7 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
         const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
         if (!message) return respond(res, 200, { status: 'ignored' });
         const result = await store.insert(message); eventCount++; if (!result.inserted) duplicateCount++;
+        if(result.inserted&&pool)void dispatchNotification(notificationStore,result.message,accountsById(config,account.id));
         return respond(res, 200, { status: result.inserted ? 'stored' : 'duplicate', message_id: result.message.id });
       }
       if (req.method === 'GET' && url.pathname === '/api/accounts') {
@@ -204,6 +213,19 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
           if(req.method==='DELETE'&&watchPath[1]){const removed=await priorityStore.deleteWatchPerson(decodeURIComponent(watchPath[1]));if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Watch person not found',retryable:false}});activePriorityConfig=await priorityStore.list();return respond(res,200,{deleted:true});}
         }
 
+      if(req.method==='GET'&&url.pathname==='/api/admin/notifications'){
+        if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+        const settings=await notificationStore.get();return respond(res,200,{settings:{...settings,webhookSecretConfigured:Boolean(settings.webhookSecret),webhookSecret:undefined}});
+      }
+      if(req.method==='PUT'&&url.pathname==='/api/admin/notifications'){
+        if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+        try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be an object');const input=body as Record<string,unknown>;const previous=await notificationStore.get();const enabled=input.enabled===undefined?previous.enabled:input.enabled;if(typeof enabled!=='boolean')throw new Error('enabled must be boolean');const url=input.webhookUrl===undefined?previous.webhookUrl:input.webhookUrl;if(typeof url!=='string'||url.length>2048)throw new Error('Invalid webhookUrl');if(url){const parsed=new URL(url);if(parsed.protocol!=='https:')throw new Error('Webhook URL must use HTTPS');}const secret=input.webhookSecret===undefined?'':input.webhookSecret;if(typeof secret!=='string'||secret.length>4096)throw new Error('Invalid webhookSecret');const minPriority=input.minPriority??previous.minPriority;if(!['P0','P1','P2','P3','P4'].includes(String(minPriority)))throw new Error('Invalid minPriority');const includePreview=input.includePreview===undefined?previous.includePreview:input.includePreview;if(typeof includePreview!=='boolean')throw new Error('includePreview must be boolean');const timeoutMs=input.timeoutMs??previous.timeoutMs,maxAttempts=input.maxAttempts??previous.maxAttempts;if(typeof timeoutMs!=='number'||!Number.isInteger(timeoutMs)||timeoutMs<500||timeoutMs>60000)throw new Error('timeoutMs must be 500..60000');if(typeof maxAttempts!=='number'||!Number.isInteger(maxAttempts)||maxAttempts<1||maxAttempts>10)throw new Error('maxAttempts must be 1..10');await notificationStore.put({enabled,webhookUrl:url,webhookSecret:secret||previous.webhookSecret,minPriority:minPriority as 'P0'|'P1'|'P2'|'P3'|'P4',includePreview,timeoutMs,maxAttempts});const saved=await notificationStore.get();return respond(res,200,{settings:{...saved,webhookSecret:undefined,webhookSecretConfigured:Boolean(saved.webhookSecret)}});}catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid notification config',retryable:false}});}
+      }
+      if(req.method==='POST'&&url.pathname==='/api/admin/notifications/test'){
+        if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+        const settings=await notificationStore.get();if(!settings.enabled)return respond(res,409,{error:{code:'NOTIFICATIONS_DISABLED',message:'Enable notifications before testing',retryable:false}});if(!settings.webhookUrl||!settings.webhookSecret)return respond(res,409,{error:{code:'NOTIFICATION_CONFIG_INCOMPLETE',message:'Webhook URL and secret are required',retryable:false}});
+        try{await new HermesWebhookNotifier({url:settings.webhookUrl,secret:settings.webhookSecret,timeoutMs:settings.timeoutMs}).notify({event:'test',account:'admin-console',message_id:null,priority:settings.minPriority,sender:'',conversation:'',preview:'',reason:'Admin notification test'});return respond(res,200,{sent:true});}catch(error){return respond(res,502,{error:{code:'NOTIFICATION_TEST_FAILED',message:error instanceof Error?error.message:'Webhook delivery failed',retryable:false}});}
+      }
       if (req.method === 'GET' && url.pathname === '/api/admin/audit') {
         if (!safeTokenEqual(config.apiToken,bearer(req))) return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
         const limit=Number(url.searchParams.get('limit')??50),offset=Number(url.searchParams.get('offset')??0);
@@ -322,6 +344,7 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
       const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
       if (!message) return;
       const result = await store.insert(message); eventCount++; if (!result.inserted) duplicateCount++;
+      if(result.inserted&&pool)void dispatchNotification(notificationStore,result.message,account);
     });
     socket.on('close', () => { if (peers.get(account.id) === peer) peers.delete(account.id); for (const [key, resolve] of peer.pending) { peer.pending.delete(key); resolve({ error: 'disconnected' }); } logger.warn({ account_id: account.id }, 'OneBot transport disconnected'); });
     socket.on('error', (err: Error) => logger.warn({ account_id: account.id, error: err.message }, 'OneBot socket error'));

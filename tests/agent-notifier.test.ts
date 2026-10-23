@@ -47,3 +47,5 @@ test('Hermes notifier requires explicit positive timeout and secret', () => {
   assert.throws(() => new HermesWebhookNotifier({ url: 'http://localhost', secret: 'x', timeoutMs: 0 }), /timeoutMs/);
   assert.throws(() => new HermesWebhookNotifier({ url: 'http://localhost', secret: '', timeoutMs: 100 }), /secret/);
 });
+
+test('Hermes notifier aborts timed-out requests', async () => { const notifier=new HermesWebhookNotifier({url:'http://localhost/hook',secret:'x',timeoutMs:5,fetch:async (_url,init)=>new Promise<Response>((_resolve,reject)=>init?.signal?.addEventListener('abort',()=>reject(new Error('aborted'))))}); await assert.rejects(notifier.notify(event),/aborted/); });
