@@ -5,6 +5,8 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
+COPY public ./public
+COPY scripts ./scripts
 RUN npm run build
 
 FROM node:24.22.1-alpine
