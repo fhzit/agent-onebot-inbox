@@ -61,6 +61,7 @@ test('revoke rejects malformed and out-of-range int32 IDs', async () => {
   const runtime = await startServer({ host: '127.0.0.1', port, apiToken: 'api-secret', maxMessageBytes: 100000, logMessageContent: false, accounts: [account] });
   try {
     const headers = { authorization: 'Bearer api-secret', 'content-type': 'application/json' };
+    await new Promise(resolve => setTimeout(resolve, 30));
     for (const message_id of [1.5, '1e2', 2147483648, -2147483649]) {
       const response = await fetch(`http://127.0.0.1:${port}/api/messages/revoke`, { method: 'POST', headers, body: JSON.stringify({ account_id: 'main', message_id }) });
       assert.equal(response.status, 400);
