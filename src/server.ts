@@ -21,6 +21,7 @@ import { HermesWebhookNotifier, type AgentNotification } from './agent-notifier.
 import { PostgresNotificationDeliveryStore, type NotificationDelivery } from './notification-delivery-store.js';
 import { MemoryNotificationConfigStore, PostgresNotificationConfigStore, type NotificationConfigStore } from './notification-settings.js';
 import { RuntimeOneBotService } from './runtime-onebot-service.js';
+import { PostgresOutboundIdempotencyStore } from './outbound-idempotency-store.js';
 import { adminPage } from './admin-page.js';
 import {ContactsCache} from './contacts-cache.js';
 import {resolveContact} from './contact-resolver.js';
@@ -132,7 +133,7 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   if (!config.apiToken) throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
   if (config.accounts.some(a => a.enabled && !a.access_token)) throw new Error('Every enabled account requires access_token');
 const peers = new Map<string, Peer>();
-  const onebot = new RuntimeOneBotService(peers, store);
+  const onebot = new RuntimeOneBotService(peers, store, 15000, pool ? new PostgresOutboundIdempotencyStore(pool) : undefined);
   const contactSearch:ContactsStore=pool?new PostgresContactsStore(pool):new MemoryContactsStore();
   const contactsCache=new ContactsCache();
   const contactsStore:ContactsStore=contactSearch;
@@ -335,13 +336,19 @@ const peers = new Map<string, Peer>();
         const target = String(body.target_id ?? ''); const type = body.message_type;
         if (!clientRequestId || !target || (type !== 'private' && type !== 'group') || (typeof body.message !== 'string' && !Array.isArray(body.message))) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Explicit client_request_id, target_id, message_type and message are required', retryable: false } });
         try {
+          if (pool) {
+            const outgoing = await onebot.sendMessage(account, type, target, body.message as string | import('./normalize.js').Segment[], clientRequestId);
+            sendSuccess++;
+            if(auditStore)await auditStore.record({actor:'admin',action:'message.send',account_id:account.id,message_id:outgoing.id,target_type:type,target_id:target,result:'success'});
+            return respond(res, 200, { status: 'sent', message: outgoing });
+          }
           const existing = (await store.list(account.id, 200)).find(m => m.client_request_id === clientRequestId);
           if (existing) return respond(res, 200, { status: 'duplicate', message: existing });
           const outgoing = await onebot.sendMessage(account, type, target, body.message as string | import('./normalize.js').Segment[], clientRequestId);
           sendSuccess++;
           if(auditStore)await auditStore.record({actor:'admin',action:'message.send',account_id:account.id,message_id:outgoing.id,target_type:type,target_id:target,result:'success'});
           return respond(res, 200, { status: 'sent', message: outgoing });
-        } catch (error) { sendFailure++; const code = (error as { code?: string }).code;if(auditStore)await auditStore.record({actor:'admin',action:'message.send',account_id:account.id,target_type:type as string,target_id:target,result:'failure',metadata:{code:code??'ACTION_FAILED'}}); return respond(res, code === 'TRANSPORT_UNAVAILABLE' ? 503 : 502, { error: { code: code ?? 'ACTION_FAILED', message: error instanceof Error ? error.message : 'Action failed', retryable: code !== 'ACTION_REJECTED' } }); }
+        } catch (error) { sendFailure++; const code = (error as { code?: string }).code;if(auditStore)await auditStore.record({actor:'admin',action:'message.send',account_id:account.id,target_type:type as string,target_id:target,result:'failure',metadata:{code:code??'ACTION_FAILED'}}); if(code==='IDEMPOTENCY_CONFLICT')return respond(res,409,{error:{code,message:error instanceof Error?error.message:'Idempotency conflict',retryable:false}}); if(code==='IDEMPOTENCY_IN_PROGRESS')return respond(res,409,{error:{code,message:error instanceof Error?error.message:'Send is pending or uncertain; do not retry automatically',retryable:false}}); return respond(res, code === 'TRANSPORT_UNAVAILABLE' ? 503 : 502, { error: { code: code ?? 'ACTION_FAILED', message: error instanceof Error ? error.message : 'Action failed', retryable: pool ? false : code !== 'ACTION_REJECTED' } }); }
       }
       return respond(res, 404, { error: { code: 'NOT_FOUND', message: 'Route not found', retryable: false } });
     } catch (error) {

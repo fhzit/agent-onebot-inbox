@@ -2,6 +2,7 @@ import { fileURLToPath } from 'node:url';
 type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.env, fetcher: Fetcher = fetch, print: (text: string) => void = console.log): Promise<void> {
+  const SEARCH_MAX_MESSAGES = 10_000;
   const base = env.AOI_API_URL;
   if (!base) throw new Error('AOI_API_URL is required; configure it to point at the running inbox API (server memory is process-local).');
   let parsedBase: URL;
@@ -30,23 +31,41 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
       path = '/api/summary'; break;
     case 'search':
       if (!positional.length) throw new Error('search requires a query');
-      params.set('limit', '200'); path = '/api/messages'; break;
+      params.set('limit', '200'); params.set('offset', '0'); path = '/api/messages'; break;
     default: throw new Error('Usage: aoi accounts|unread|recent|summary|search <query> [--account ID] [--limit N] [--since ISO]');
   }
   const target = new URL(path, parsedBase);
   target.search = params.toString();
   const headers: Record<string, string> = { accept: 'application/json' };
   if (env.AOI_API_TOKEN) headers.authorization = `Bearer ${env.AOI_API_TOKEN}`;
+  if (command === 'search') {
+    const messages: Array<{ plain_text?: string }> = [];
+    let offset = 0;
+    while (true) {
+      target.searchParams.set('offset', String(offset));
+      const response = await fetcher(target, { method: 'GET', headers });
+      const text = await response.text();
+      if (!response.ok) throw new Error(`API request failed (${response.status}): ${text}`);
+      let page: unknown;
+      try { page = JSON.parse(text); } catch { throw new Error('API returned invalid JSON'); }
+      if (!page || typeof page !== 'object') throw new Error('API returned invalid pagination metadata');
+      const body = page as { messages?: unknown; total?: unknown; offset?: unknown; limit?: unknown; has_more?: unknown };
+      const total = body.total, pageOffset = body.offset, limit = body.limit;
+      if (!Array.isArray(body.messages) || typeof total !== 'number' || !Number.isInteger(total) || typeof pageOffset !== 'number' || !Number.isInteger(pageOffset) || typeof limit !== 'number' || !Number.isInteger(limit) || typeof body.has_more !== 'boolean' || pageOffset !== offset || limit <= 0 || total < 0 || (body.has_more && body.messages.length !== limit) || (body.has_more && offset + body.messages.length >= total) || (!body.has_more && offset + body.messages.length !== total)) throw new Error('API returned invalid pagination metadata');
+      if (messages.length + body.messages.length > SEARCH_MAX_MESSAGES) throw new Error(`Search exceeds maximum of ${SEARCH_MAX_MESSAGES} messages`);
+      messages.push(...body.messages as Array<{ plain_text?: string }>);
+      if (!body.has_more) break;
+      offset += body.messages.length;
+    }
+    const query = positional.join(' ').toLocaleLowerCase();
+    print(JSON.stringify({ messages: messages.filter(message => message.plain_text?.toLocaleLowerCase().includes(query)) }, null, 2));
+    return;
+  }
   const response = await fetcher(target, { method: 'GET', headers });
   const text = await response.text();
   if (!response.ok) throw new Error(`API request failed (${response.status}): ${text}`);
   let result: unknown;
   try { result = JSON.parse(text); } catch { throw new Error('API returned invalid JSON'); }
-  if (command === 'search') {
-    const messages = (result as { messages?: Array<{ plain_text?: string }> }).messages ?? [];
-    const query = positional.join(' ').toLocaleLowerCase();
-    result = { messages: messages.filter(message => message.plain_text?.toLocaleLowerCase().includes(query)) };
-  }
   print(JSON.stringify(result, null, 2));
 }
 
