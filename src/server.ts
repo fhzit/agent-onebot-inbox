@@ -188,8 +188,10 @@ const peers = new Map<string, Peer>();
             const old=config.accounts.find(a=>a.id===accountId);const secret=typeof value.access_token==='string'&&value.access_token?value.access_token:old?.access_token;
             if(value.enabled!==false&&!secret)throw new Error('An enabled account requires access_token');
             const account:AccountConfig={id:accountId,alias:(value.alias as string).trim(),self_id:(value.self_id as string).trim(),provider,enabled:value.enabled!==false,permission:permission as AccountConfig['permission'],...(secret?{access_token:secret}:{}),...(typeof value.action_url==='string'&&value.action_url?{action_url:value.action_url}:{})};
-            if(id){const updated=await accountStore.update(id,account);if(!updated)return respond(res,404,{error:{code:'NOT_FOUND',message:'Account not found',retryable:false}});const index=config.accounts.findIndex(a=>a.id===id);if(index>=0)config.accounts[index]=account;else config.accounts.push(account);}
-            else {await accountStore.create(account);config.accounts.push(account);}
+            if(id){const updated=await accountStore.update(id,account);if(!updated)return respond(res,404,{error:{code:'NOT_FOUND',message:'Account not found',retryable:false}});}
+            else {await accountStore.create(account);}
+            config.accounts=await accountStore.loadConfiguredAccounts();
+            const changed=peers.get(accountId);if(changed){changed.socket.close();peers.delete(accountId);}
             return respond(res,id?200:201,{account:{id:account.id,alias:account.alias,self_id:account.self_id,provider:account.provider,enabled:account.enabled,permission:account.permission,access_token_configured:Boolean(secret),connected:false}});
           }catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid account',retryable:false}});}
         }

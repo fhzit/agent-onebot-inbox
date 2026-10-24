@@ -2,7 +2,7 @@
 
 > 多 QQ 账号 OneBot 收件箱与 AI Agent 接入层。把私聊、群聊和 Agent 工具接入同一个可查询的 Inbox。
 
-**当前状态：早期开发版 / 不适合生产运行。** 本项目有可运行的 API、MCP 接口和 OneBot v11 接入基础，但服务运行时的消息与 Inbox 状态仍在内存中。重启会丢数据；PostgreSQL repository/migrations 尚未接入运行时，也没有通过真实 QQ、NapCat 或 SnowLuma 账户做端到端验收。请勿用于无人值守的生产消息处理或未经确认的发送操作。
+**当前状态：早期开发版 / 不适合生产运行。** 账号管理可保存 QQ 账号的 OneBot 配置，但不能替你安装 NapCat/SnowLuma 或登录 QQ；消息运行时目前仍以内存为主，重启会丢失消息。项目没有完成真实 QQ 端到端验收。请勿用于无人值守生产消息处理。
 
 [项目状态](docs/status.md) · [API](docs/api.md) · [安全说明](docs/security.md) · [验证记录](docs/validation.md) · [贡献指南](CONTRIBUTING.md)
 
@@ -29,7 +29,7 @@ NapCat / SnowLuma
 - 消息归一化、未知 CQ segment 保留、事件去重；基础优先级评分。
 - Inbox 查询过滤与分页、上下文查询、Agent 处理/忽略状态。读取和更新 Agent 状态不会触发 QQ 标记已读。
 - MCP TypeScript SDK（stdio 与 Streamable HTTP）、只读 API CLI。
-- PostgreSQL schema、迁移器与独立 repository 原型；**目前不承载 API runtime 数据**。
+- PostgreSQL schema、migration runner 和 runtime message/Inbox repository 已接线；当前生产容器已通过数据库连接 readiness。备份恢复及真实 provider 行为仍未验证。
 - Hermes Generic V2 通知客户端原型，带签名与精简字段；尚未接入事件处理流程。
 
 详见[实现状态与未完成项](docs/status.md)。这不是 NapCat/SnowLuma 完整适配声明；各 provider 的真实兼容性尚未实测。
@@ -77,7 +77,7 @@ curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:8080/api/accounts
 
 - Reverse WebSocket 共享入口：`ws://<host>:8080/onebot/v11/ws`
 - 显式账号入口：`ws://<host>:8080/onebot/v11/ws/<accountId>`
-- HTTP Event：`POST /onebot/v11/events/<accountId>`，使用该账号的 bearer token。
+若部署在另一个域名或容器网络，将 `wss://<your-inbox-host>` 换成服务可达地址。将同一个高熵令牌配置给 provider 的 OneBot Reverse WS 客户端和 Inbox 账号 `access_token`。`self_id` 是登录 QQ 后 OneBot 上报的 QQ 号。账号保存后，需在 provider 侧连接到该地址；连接成功才开始收事件。
 
 公网部署前必须自行配置 TLS、反向代理访问控制、网络隔离和速率限制。请先用只读账号和测试环境验证连接，不要把 API 或 OneBot 入口裸露到公网。
 
@@ -107,18 +107,19 @@ npm run aoi -- search 报名 --account main
 
 ## Management console
 
-- The console includes Inbox, account management (authenticated create/update/delete with write-only transport tokens), persisted priority rules and watched people (when PostgreSQL is configured), runtime status, and a read-only audit-history table backed by authenticated `GET /api/admin/audit`.
+- In the admin UI, open **设置 → 账号** and choose **添加账号**. Enter a unique internal ID, display name, your QQ `self_id`, provider (`napcat` or `snowluma`), and the OneBot access token. Keep permission at **readonly** until you intentionally enable sending. Enable the account only after its OneBot endpoint is reachable. For NapCat/SnowLuma, configure a Reverse WebSocket client targeting `wss://<your-inbox-host>/onebot/v11/ws/<account-id>` with the same access token; do not expose an unauthenticated OneBot endpoint publicly. Creating an account does not install or log in to QQ for you.
+- If managing outside the UI, use authenticated `POST /api/admin/accounts` with `{id,alias,self_id,provider,access_token,permission,enabled,action_url?}`; omit secrets from logs and shell history. PostgreSQL mode encrypts account tokens with `ACCOUNT_ENCRYPTION_KEY`; admin reads redact secret values.
+- The console includes Inbox, account management, persisted priority rules/watch people, notification settings, runtime status, and read-only audit history. Provider onboarding/connection controls are still incomplete; use the provider's own UI/config to log in and set up Reverse WS.
 - Notification settings support a Hermes Generic V2 webhook, priority threshold, optional message preview, timeout/retry bounds, and a test action. Secrets are encrypted with the runtime `ACCOUNT_ENCRYPTION_KEY`; delivery uses bounded synchronous retries and is best-effort (the durable queue/delivery ledger is not wired yet).
 - Account token values are write-only and never returned by management APIs; PostgreSQL mode encrypts them with AES-256-GCM using the externally supplied `ACCOUNT_ENCRYPTION_KEY` (base64-encoded 32 bytes). Keep this key in the protected runtime environment and back it up separately; losing it makes stored account tokens unrecoverable. Memory mode is volatile. The admin UI keeps its API token in tab memory only. In-memory settings disappear on process restart.
 - The admin page build parses inline JavaScript with Node during typecheck/build; tests extract the served HTML and verify script syntax.
 
 ## Still missing or unverified
 
-- Full provider onboarding and transport lifecycle; contact/group/member synchronization; AI classification, summarization, and task extraction.
-- Notification batching/digests, durable delivery queue and delivery log. Current Hermes V2 webhook settings/integration are best-effort only.
-- Complete write-side audit coverage and append-only audit policy; current admin audit view is read-only over existing rows.
-- Attachment transfer/retention controls; backup and restore; user/role management; complete MCP surface and production remote MCP lifecycle.
-- Live PostgreSQL runtime/migration/restart verification, real QQ/NapCat/SnowLuma delivery, production security review, load testing, and deployment of recent admin changes.
+- 端到端 provider 接入与传输生命周期、联系人路由解析、联系人搜索/编辑和联系人变更事件同步。
+- AI 分类、摘要、任务提取；通知聚合/摘要、持久队列、投递历史和重试状态。
+- 完整写操作审计、附件上传下载、备份恢复、用户角色、完整 MCP 操作面。
+- 真实 QQ/provider 端到端兼容性、安全和负载评估；公网 Cloudflare 访问链路仍需修复/验收。
 
 Keep the Alpha/non-production-ready warning. Do not describe a feature as complete without its configuration UI, authenticated API, persistence, runtime effect, and tests.
 
@@ -129,8 +130,8 @@ The image is an early-development build, not a production deployment promise. Co
 
 ## 数据与安全边界
 
-- 消息和 Agent 状态目前以内存保存，进程重启即丢失。
-- PostgreSQL 迁移器/repository 有单元测试，但没有接入服务运行时，也没有真实数据库联调结论。
+- PostgreSQL-backed message/inbox runtime is wired when `DATABASE_URL` is configured. Service restart should not erase PostgreSQL-backed messages; backup/restore is not yet verified.
+- PostgreSQL runtime and migration have passed local tests plus live production container readiness checks; a full restore drill and real database-backed message-ingest round trip have not been verified yet.
 - 发送需要 API 鉴权、显式账号和明确目标；账号默认应为 `readonly`。生产环境的授权策略、并发幂等、审计日志和恢复机制尚不完整。
 - 撤回仅允许对当前内存库中已知的本人发出消息操作；撤回记录没有持久审计。
 - 附件仅有元数据/本地路径安全辅助函数，没有完整 OneBot 下载、上传和服务 API。

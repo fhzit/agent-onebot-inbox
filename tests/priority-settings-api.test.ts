@@ -14,6 +14,7 @@ test('account management is authenticated and supports create, update, redacted 
   const created=await fetch(`${base}/api/admin/accounts`,{method:'POST',headers,body:JSON.stringify({id:'secondary',alias:'Secondary',self_id:'20002',provider:'napcat',access_token:'new-private-token',permission:'readonly'})});assert.equal(created.status,201);const result=await created.json() as {account:{id:string;access_token_configured:boolean}};assert.equal(result.account.access_token_configured,true);assert.equal(JSON.stringify(result).includes('new-private-token'),false);
   const list=await fetch(`${base}/api/admin/accounts`,{headers:{authorization:`Bearer ${token}`}});const listed=await list.json() as {accounts:{id:string;access_token_configured:boolean}[]};assert.equal(listed.accounts.length,2);assert.equal(listed.accounts.find(a=>a.id==='secondary')?.access_token_configured,true);
   const updated=await fetch(`${base}/api/admin/accounts/secondary`,{method:'PUT',headers,body:JSON.stringify({alias:'Secondary updated',self_id:'20002',provider:'snowluma',enabled:false,permission:'confirm'})});assert.equal(updated.status,200);
+  assert.equal((await fetch(`${base}/api/accounts`,{headers:{authorization:`Bearer ${token}`}})).status,200);
   assert.equal((await fetch(`${base}/api/admin/accounts/secondary`,{method:'DELETE',headers})).status,200);
  }finally{await runtime.close();}
 });

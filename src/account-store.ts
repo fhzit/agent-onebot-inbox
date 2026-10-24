@@ -7,6 +7,7 @@ export type AccountStore = {
  create(account:AccountConfig):Promise<void>;
  update(id:string,account:AccountConfig):Promise<boolean>;
  remove(id:string):Promise<boolean>;
+ loadConfiguredAccounts():Promise<AccountConfig[]>;
 };
 
 export class MemoryAccountStore implements AccountStore {
@@ -15,6 +16,7 @@ export class MemoryAccountStore implements AccountStore {
  async create(a:AccountConfig){if(this.accounts.has(a.id)||[...this.accounts.values()].some(x=>x.self_id===a.self_id))throw new Error('Duplicate account id or self_id');this.accounts.set(a.id,structuredClone(a));}
  async update(id:string,a:AccountConfig){if(!this.accounts.has(id))return false;if([...this.accounts.values()].some(x=>x.id!==id&&x.self_id===a.self_id))throw new Error('Duplicate self_id');this.accounts.set(id,structuredClone(a));return true;}
  async remove(id:string){return this.accounts.delete(id);}
+ async loadConfiguredAccounts(){return [...this.accounts.values()].map(account=>structuredClone(account));}
 }
 
 export class PostgresAccountStore implements AccountStore {
