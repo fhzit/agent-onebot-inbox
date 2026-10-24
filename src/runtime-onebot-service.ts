@@ -15,7 +15,15 @@ export class RuntimeOneBotService implements OneBotGateway {
   constructor(private readonly peers: Map<string, PeerLike>, private readonly store: RuntimeStore, private readonly timeoutMs = 15000) {}
   async sendMessage(account: AccountConfig, type: 'private' | 'group', target: string, message: string | Segment[], requestId: string): Promise<NormalizedMessage> {
     const saved = (await this.store.list(account.id, 200)).find(m => m.client_request_id === requestId);
-    if (saved) return saved;
+    if (saved) {
+      const expectedConversation = `${account.id}:${type}:${target}`;
+      const expectedText = (typeof message === 'string' ? [{ type: 'text', data: { text: message } }] : message).filter(s => s.type === 'text').map(s => String(s.data.text ?? '')).join('');
+      const sameContent = JSON.stringify(saved.raw_message) === JSON.stringify(message);
+      if (saved.direction !== 'outgoing' || saved.conversation_id !== expectedConversation || saved.plain_text !== expectedText || !sameContent) {
+        throw Object.assign(new Error('client_request_id was already used for a different send'), { code: 'IDEMPOTENCY_CONFLICT' });
+      }
+      return saved;
+    }
     const peer = this.peers.get(account.id);
     const action = type === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = type === 'private' ? { user_id: target, message } : { group_id: target, message };
