@@ -14,9 +14,11 @@ test('contacts_list requires an explicit account and returns only that account s
   assert.deepEqual(JSON.parse(response.content[0]!.text!), snapshot);
 });
 
-test('contacts_list rejects an empty account ID at the schema boundary', () => {
+test('contacts_list rejects an empty account ID through MCP tool input validation', async () => {
+  let called = false;
   const server = new McpServer({ name: 'test', version: '1' });
-  registerContactsListTool(server, { get: async () => { throw new Error('must not be called'); } } as never);
-  const tool = (server as unknown as { _registeredTools: Record<string, { inputSchema: unknown }> })._registeredTools.contacts_list!;
-  assert.ok(tool.inputSchema);
+  registerContactsListTool(server, { get: async () => { called = true; throw new Error('must not be called'); } } as never);
+  const tool = (server as unknown as { _registeredTools: Record<string, unknown>; validateToolInput: (tool: unknown, args: unknown, name: string) => Promise<unknown> })._registeredTools.contacts_list!;
+  await assert.rejects(() => (server as unknown as { validateToolInput: (tool: unknown, args: unknown, name: string) => Promise<unknown> }).validateToolInput(tool, { account_id: '' }, 'contacts_list'), /Input validation error/);
+  assert.equal(called, false);
 });
