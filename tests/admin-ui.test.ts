@@ -65,6 +65,9 @@ test('serves a local admin UI without embedding secrets or external assets', asy
     assert.match(html, /loadAudit/);
     assert.match(html, /api\/admin\/audit/);
     assert.match(html, /contactSyncForm/);
+    assert.ok(html.includes("$('contactAccount').addEventListener('change',()=>{void refreshContactLists()})"));
+    assert.ok(html.includes('loadContacts(previousContactAccount);'));
+    assert.ok(html.includes("encodeURIComponent(id)}/contacts`"));
     assert.match(html, /sync-friends/);
     assert.match(html, /sync-groups/);
     assert.match(html, /sync-members/);
