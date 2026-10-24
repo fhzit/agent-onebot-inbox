@@ -287,14 +287,17 @@ const peers = new Map<string, Peer>();
         const body = await readBody(req, config.maxMessageBytes) as Record<string, unknown>;
         const account = accountById(config, String(body.account_id ?? ''));
         if (!account) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Explicit enabled account is required', retryable: false } });
-        if (account.permission !== 'direct') return respond(res, 403, { error: { code: 'PERMISSION_DENIED', message: `Account permission is ${account.permission}`, retryable: false } });
+        if (account.permission !== 'direct') { if(auditStore)await auditStore.record({actor:'admin',action:'message.revoke',account_id:account.id,target_type:'message',target_id:String(body.message_id??''),result:'failure',metadata:{code:'PERMISSION_DENIED'}});return respond(res, 403, { error: { code: 'PERMISSION_DENIED', message: `Account permission is ${account.permission}`, retryable: false } }); }
         const rawId = body.message_id;
         const messageId = typeof rawId === 'number' ? rawId : typeof rawId === 'string' && /^-?\d+$/.test(rawId) ? Number(rawId) : NaN;
         if (!Number.isSafeInteger(messageId) || messageId < -2147483648 || messageId > 2147483647) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'message_id must be a OneBot v11 int32', retryable: false } });
         const known = (await store.list(account.id, 200)).find(m => m.direction === 'outgoing' && m.external_message_id === String(messageId));
         if (!known) return respond(res, 404, { error: { code: 'MESSAGE_NOT_FOUND', message: 'Only known outgoing messages can be revoked', retryable: false } });
         const peer = peers.get(account.id);
-        if (!peer || peer.socket.readyState !== WebSocket.OPEN) return respond(res, 503, { error: { code: 'TRANSPORT_UNAVAILABLE', message: 'No connected Reverse WS peer', retryable: true } });
+        if (!peer || peer.socket.readyState !== WebSocket.OPEN) {
+          if(auditStore)await auditStore.record({actor:'admin',action:'message.revoke',account_id:account.id,message_id:known.id,target_type:'message',target_id:String(messageId),result:'failure',metadata:{code:'TRANSPORT_UNAVAILABLE'}});
+          return respond(res, 503, { error: { code: 'TRANSPORT_UNAVAILABLE', message: 'No connected Reverse WS peer', retryable: true } });
+        }
         try {
           const response = await callWsAction(peer, 'delete_msg', { message_id: messageId }, 15000);
           if(auditStore)await auditStore.record({actor:'admin',action:'message.revoke',account_id:account.id,message_id:known.id,target_type:'message',target_id:String(messageId),result:'success'});
@@ -310,7 +313,7 @@ const peers = new Map<string, Peer>();
         const body = await readBody(req, config.maxMessageBytes) as Record<string, unknown>;
         const account = accountById(config, String(body.account_id ?? ''));
         if (!account) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Explicit enabled account is required', retryable: false } });
-        if (account.permission !== 'direct') return respond(res, 403, { error: { code: 'PERMISSION_DENIED', message: `Account permission is ${account.permission}`, retryable: false } });
+        if (account.permission !== 'direct') { if(auditStore)await auditStore.record({actor:'admin',action:'message.send',account_id:account.id,target_type:String(body.message_type??''),target_id:typeof body.target_id==='string'?body.target_id:null,result:'failure',metadata:{code:'PERMISSION_DENIED'}});return respond(res, 403, { error: { code: 'PERMISSION_DENIED', message: `Account permission is ${account.permission}`, retryable: false } }); }
         const clientRequestId = typeof body.client_request_id === 'string' ? body.client_request_id : '';
         const target = String(body.target_id ?? ''); const type = body.message_type;
         if (!clientRequestId || !target || (type !== 'private' && type !== 'group') || (typeof body.message !== 'string' && !Array.isArray(body.message))) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Explicit client_request_id, target_id, message_type and message are required', retryable: false } });

@@ -16,7 +16,8 @@ Agent OneBot Inbox remains an Alpha under active development, not the complete p
 - PostgreSQL migrations run at startup and `PostgresMessageStore` is wired into the server runtime when `DATABASE_URL` is set. The latest production container reached healthy readiness with PostgreSQL connected; full provider round-trip and backup/restore are not verified.
 - Send-route resolution, contact search/edit and provider contact-change events.
 - AI classification, summaries, and task extraction; durable notification queue, batching/digests, delivery history.
-- Append-only audit policy and coverage for every sensitive admin setting/write path; connected audit currently records account CRUD, message ingest/process/send/revoke, and test-notification outcomes.
+- Append-only audit table access for the `aoi_app` role is applied on fresh installs and during upgrade migration `0008_legacy_account_ids.sql`.
+- Sensitive admin operations are recorded for account CRUD, priority/watch-person CRUD, notification configuration/tests, inbox state changes, sends/revokes (including denied attempts), and inbound message ingestion. Validation/transport failures before provider actions are covered where applicable.
 - Attachment upload/download, backup/restore, user roles, and full MCP operation coverage.
 - Real QQ/provider end-to-end, security and load testing; public Cloudflare reachability is still failing/unchecked.
 

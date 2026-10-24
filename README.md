@@ -120,7 +120,7 @@ npm run aoi -- search 报名 --account main
 - Contact-aware send-route resolution, contact search/edit, and contact change/member-role event sync.
 - AI classification, summaries, and task extraction.
 - Durable notification queue, batching/digests, delivery ledger, and retry persistence.
-- Audit rows are written to PostgreSQL for sensitive admin actions; API exposure remains read-only. The application role cannot update/delete/truncate audit rows. This does not protect against database-owner tampering, and the deployment currently uses a shared application DB role; an independently administered audit sink and retention policy are not implemented.
+- Audit rows are written to PostgreSQL for sensitive admin actions; API exposure remains read-only. The application role cannot update/delete/truncate audit rows. This does not protect against database-owner tampering, and deployment currently uses a shared application DB role; an independently administered audit sink and retention policy are not implemented.
 - Attachment upload/download, backup/restore drill, user-role management, and full MCP tools/remote transport lifecycle.
 - Real QQ/provider end-to-end, security/load tests, and publicly reachable Cloudflare route validation.
 
