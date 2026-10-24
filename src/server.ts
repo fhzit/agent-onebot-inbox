@@ -130,8 +130,9 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   if (config.accounts.some(a => a.enabled && !a.access_token)) throw new Error('Every enabled account requires access_token');
 const peers = new Map<string, Peer>();
   const onebot = new RuntimeOneBotService(peers, store);
+  const contactSearch:ContactsStore=pool?new PostgresContactsStore(pool):new MemoryContactsStore();
   const contactsCache=new ContactsCache();
-  const contactsStore:ContactsStore=pool?new PostgresContactsStore(pool):new MemoryContactsStore();
+  const contactsStore:ContactsStore=contactSearch;
   const contactSync=new ContactSyncService(onebot,contactsCache,contactsStore,options.accountEncryptionKey??config.apiToken);
   let eventCount = 0; let duplicateCount = 0; let sendSuccess = 0; let sendFailure = 0;
   const server = createServer();
@@ -341,7 +342,7 @@ const peers = new Map<string, Peer>();
     }
   };
   const wss = new WebSocketServer({ noServer: true, maxPayload: config.maxMessageBytes });
-  const mcp = createMcpService(config, store);
+  const mcp = createMcpService(config, store, contactsStore);
   server.removeAllListeners('request');
   server.on('request', (req, res) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
