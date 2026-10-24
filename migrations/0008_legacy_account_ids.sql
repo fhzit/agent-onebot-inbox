@@ -1,0 +1,17 @@
+ALTER TABLE accounts ALTER COLUMN id TYPE text USING id::text;
+ALTER TABLE accounts ALTER COLUMN id SET DEFAULT gen_random_uuid()::text;
+ALTER TABLE conversations ALTER COLUMN account_id TYPE text USING account_id::text;
+ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_account_id_fkey;
+ALTER TABLE conversations ADD CONSTRAINT conversations_account_id_fkey FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE;
+ALTER TABLE inbox_messages ALTER COLUMN account_id TYPE text USING account_id::text;
+ALTER TABLE inbox_messages DROP CONSTRAINT IF EXISTS inbox_messages_account_id_fkey;
+ALTER TABLE inbox_messages ADD CONSTRAINT inbox_messages_account_id_fkey FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE;
+ALTER TABLE contacts ALTER COLUMN account_id TYPE text USING account_id::text;
+ALTER TABLE contacts DROP CONSTRAINT IF EXISTS contacts_account_id_fkey;
+ALTER TABLE contacts ADD CONSTRAINT contacts_account_id_fkey FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE;
+ALTER TABLE group_members ALTER COLUMN account_id TYPE text USING account_id::text;
+ALTER TABLE group_members DROP CONSTRAINT IF EXISTS group_members_account_id_fkey;
+ALTER TABLE group_members ADD CONSTRAINT group_members_account_id_fkey FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE;
+ALTER TABLE contact_sync_state ALTER COLUMN account_id TYPE text USING account_id::text;
+ALTER TABLE contact_sync_state DROP CONSTRAINT IF EXISTS contact_sync_state_account_id_fkey;
+ALTER TABLE contact_sync_state ADD CONSTRAINT contact_sync_state_account_id_fkey FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE;
