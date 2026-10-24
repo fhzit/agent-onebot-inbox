@@ -5,7 +5,8 @@
 - [x] HTTP API basics, guarded direct send
 - [x] MCP stdio and HTTP read tools
 - [x] migration schema foundation
-- [ ] durable repository + wiring
+- [x] PostgreSQL outbound idempotency storage slice: migration and `PostgresOutboundIdempotencyStore` claim/complete implementation (not wired to send route/runtime)
+- [ ] Wire durable repository + migrations into runtime where not yet integrated
 - [ ] CLI targeting API
 
 ## Remaining product work (do not claim complete)
