@@ -5,13 +5,15 @@ import { z } from 'zod';
 import type { AppConfig } from './config.js';
 import type { MessageStore } from './store.js';
 import type { PostgresMessageStore } from './postgres-store.js';
+import type { ContactsStore } from './postgres-contacts-store.js';
 import { registerContactsSearchTool } from './mcp-contacts-search.js';
+import { registerContactsListTool } from './mcp-contacts-list.js';
 
 export interface McpService { server: McpServer; connectStdio(): Promise<void>; createHttpTransport(): StreamableHTTPServerTransport; }
 
-export function createMcpService(config: AppConfig, store: MessageStore | PostgresMessageStore, contactSearch?: Pick<import('./postgres-contacts-store.js').ContactsStore, 'search'>): McpService {
+export function createMcpService(config: AppConfig, store: MessageStore | PostgresMessageStore, contactSearch?: Pick<ContactsStore, 'search' | 'get'>): McpService {
   const server = new McpServer({ name: 'agent-onebot-inbox', version: '0.1.0' });
-  if(contactSearch)registerContactsSearchTool(server,contactSearch);
+  if(contactSearch){registerContactsSearchTool(server,contactSearch);registerContactsListTool(server,contactSearch);}
   server.registerTool('accounts_list', { description: 'List configured accounts and their enabled/permission status.', inputSchema: {} }, async () => ({ content: [{ type: 'text', text: JSON.stringify(config.accounts.map(({id, alias, self_id, provider, enabled, permission}) => ({id, alias, self_id, provider, enabled, permission}))) }] }));
   server.registerTool('inbox_list', { description: 'List recent stored messages with optional inbox filters and pagination.', inputSchema: { account_id: z.string().optional(), type: z.enum(['private','group']).optional(), sender: z.string().optional(), priority: z.enum(['P0','P1','P2','P3','P4']).optional(), at_me: z.boolean().optional(), keyword: z.string().optional(), since: z.string().optional(), until: z.string().optional(), offset: z.number().int().nonnegative().optional(), limit: z.number().int().min(1).max(200).optional() } }, async filters => ({ content: [{ type: 'text', text: JSON.stringify(await store.query(filters)) }] }));
   server.registerTool('inbox_summary', { description: 'Summarize stored messages, optionally scoped by account and ISO timestamp.', inputSchema: { account_id: z.string().optional(), since: z.string().optional() } }, async ({ account_id, since }) => ({ content: [{ type: 'text', text: JSON.stringify(await store.summary(account_id, since)) }] }));
