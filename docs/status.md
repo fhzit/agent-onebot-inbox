@@ -13,10 +13,11 @@ Agent OneBot Inbox remains an Alpha under active development, not the complete p
 ## Still missing or not production-ready
 
 - End-to-end provider onboarding, transport lifecycle/reconnect, and verified NapCat/SnowLuma capability adapters.
-- PostgreSQL migrations run at startup and `PostgresMessageStore` is wired into the server runtime when `DATABASE_URL` is set. The latest production container reached healthy readiness with PostgreSQL connected. This is not yet a full provider end-to-end or backup/restore verification.
+- PostgreSQL migrations run at startup and `PostgresMessageStore` is wired into the server runtime when `DATABASE_URL` is set. The latest production container reached healthy readiness with PostgreSQL connected; full provider round-trip and backup/restore are not verified.
 - Send-route resolution, contact search/edit and provider contact-change events.
 - AI classification, summaries, and task extraction; durable notification queue, batching/digests, delivery history.
-- Complete write audit, attachment upload/download, backup/restore, user roles, and full MCP operation coverage.
-- Real QQ/provider end-to-end, security and load testing; deployment hardening and public reachability still need validation.
+- Append-only audit policy and coverage for every sensitive admin setting/write path; connected audit currently records account CRUD, message ingest/process/send/revoke, and test-notification outcomes.
+- Attachment upload/download, backup/restore, user roles, and full MCP operation coverage.
+- Real QQ/provider end-to-end, security and load testing; public Cloudflare reachability is still failing/unchecked.
 
 This remains an Alpha / early-development project, not a finished or production-ready implementation.

@@ -9,3 +9,6 @@ ALTER TABLE group_members ADD CONSTRAINT group_members_account_id_fkey FOREIGN K
 ALTER TABLE contact_sync_state ALTER COLUMN account_id TYPE text USING account_id::text;
 ALTER TABLE contact_sync_state DROP CONSTRAINT IF EXISTS contact_sync_state_account_id_fkey;
 ALTER TABLE contact_sync_state ADD CONSTRAINT contact_sync_state_account_id_fkey FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE;
+ALTER TABLE audit_logs ALTER COLUMN actor TYPE text;
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_logs FROM aoi_app;
+GRANT INSERT, SELECT ON audit_logs TO aoi_app;

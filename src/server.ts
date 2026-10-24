@@ -15,6 +15,7 @@ import { classifyActionResponse, resolveReverseWsAccount } from './reverse-ws.js
 import { applyPriority, type PriorityConfig } from './priority.js';
 import { MemoryPriorityStore, PostgresPriorityStore, type PriorityStore } from './priority-store.js';
 import { MemoryAccountStore, PostgresAccountStore, type AccountStore } from './account-store.js';
+import { PostgresAuditStore,type AuditStore } from './audit-store.js';
 import type { PriorityRule } from './priority.js';
 import { HermesWebhookNotifier, type AgentNotification } from './agent-notifier.js';
 import { MemoryNotificationConfigStore, PostgresNotificationConfigStore, type NotificationConfigStore } from './notification-settings.js';
@@ -26,7 +27,7 @@ import {PostgresContactsStore,type ContactsStore, type ContactsSnapshot} from '.
 
 export type Peer = { account: AccountConfig; socket: WebSocket; connectedAt: number; pending: Map<string, (value: unknown) => void> };
 class MemoryContactsStore implements ContactsStore{private snapshots=new Map<string,ContactsSnapshot>();async get(id:string){return structuredClone(this.snapshots.get(id)??{friends:[],groups:[],members:[],last_synced:{friends:null,groups:null,members:{}}});}async replaceFriends(id:string,rows:readonly import('./contacts-cache.js').Friend[],syncedAt=new Date()){const s=await this.get(id);s.friends=[...rows];s.last_synced.friends=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroups(id:string,rows:readonly import('./contacts-cache.js').Group[],syncedAt=new Date()){const s=await this.get(id);s.groups=[...rows];s.last_synced.groups=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroupMembers(id:string,groupId:string|number,rows:readonly import('./contacts-cache.js').GroupMember[],syncedAt=new Date()){const s=await this.get(id);s.members=s.members.filter(x=>x.group_id!==String(groupId));s.members.push({group_id:String(groupId),members:[...rows]});s.last_synced.members[String(groupId)]=syncedAt.toISOString();this.snapshots.set(id,s);}}
-export type Runtime = { close: () => Promise<void>; store: MessageStore | PostgresMessageStore; peers: Map<string, Peer>; accounts: AccountConfig[] };
+export type Runtime = { close: () => Promise<void>; store: MessageStore | PostgresMessageStore; peers: Map<string, Peer>; accounts: AccountConfig[]; address:()=>import('node:net').AddressInfo|null };
 type Logger = { info: (data: unknown, message?: string) => void; warn: (data: unknown, message?: string) => void; error: (data: unknown, message?: string) => void };
 const logger: Logger = {
   info: (data, message) => console.log(JSON.stringify({ level: 'info', message, ...asRecord(data) })),
@@ -95,6 +96,7 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   if(options.requireDatabase&&!options.databaseUrl)throw new Error('DATABASE_URL is required for durable runtime');
   if(!config.apiToken)throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
   let pool:Pool|undefined;let runtimeStore:MessageStore|PostgresMessageStore=store??new MessageStore();
+  let auditStore:AuditStore|undefined;
   if(!store&&options.databaseUrl){
     if(!options.accountEncryptionKey)throw new Error('ACCOUNT_ENCRYPTION_KEY is required for persistent account settings');
     pool=new Pool({connectionString:options.databaseUrl,max:10,connectionTimeoutMillis:5000});
@@ -114,6 +116,7 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
       config.accounts=[...config.accounts.filter(account=>!managedIds.has(account.id)),...managedAccounts];
       for(const account of config.accounts)if(!managedIds.has(account.id))await postgresAccountStore.create(account);
       runtimeStore=PostgresMessageStore.fromPool(pool);
+      auditStore=new PostgresAuditStore(pool);
     }catch(error){await pool.end();throw error;}
   }
   store=runtimeStore;
@@ -155,8 +158,8 @@ const peers = new Map<string, Peer>();
         const normalized = normalizeEvent(account.id, account.provider, `http:${account.id}`, event);
         const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
         if (!message) return respond(res, 200, { status: 'ignored' });
-        const result = await store.insert(message); eventCount++; if (!result.inserted) duplicateCount++;
-        if(result.inserted&&pool)void dispatchNotification(notificationStore,result.message,accountsById(config,account.id));
+            const result=await store.insert(message); eventCount++; if(!result.inserted)duplicateCount++;else if(auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
+            if(result.inserted&&pool)void dispatchNotification(notificationStore,result.message,accountsById(config,account.id));
         return respond(res, 200, { status: result.inserted ? 'stored' : 'duplicate', message_id: result.message.id });
       }
       if (req.method === 'GET' && url.pathname === '/api/accounts') {
@@ -177,8 +180,8 @@ const peers = new Map<string, Peer>();
         const id=adminAccounts[1]?decodeURIComponent(adminAccounts[1]):undefined;
         if(req.method==='GET')return respond(res,200,{accounts:await accountStore.list()});
         if(req.method==='POST'||req.method==='PUT'){
-          try{
-            const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be an object');const value=body as Record<string,unknown>;
+            const actor='admin';
+            try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be an object');const value=body as Record<string,unknown>;
             const accountId=id??(typeof value.id==='string'&&value.id?value.id:randomUUID());
             for(const key of ['alias','self_id','provider'])if(typeof value[key]!=='string'||!(value[key] as string).trim())throw new Error(`${key} is required`);
             const provider=String(value.provider);if(!['napcat','snowluma'].includes(provider))throw new Error('provider must be napcat or snowluma');
@@ -188,14 +191,17 @@ const peers = new Map<string, Peer>();
             const old=config.accounts.find(a=>a.id===accountId);const secret=typeof value.access_token==='string'&&value.access_token?value.access_token:old?.access_token;
             if(value.enabled!==false&&!secret)throw new Error('An enabled account requires access_token');
             const account:AccountConfig={id:accountId,alias:(value.alias as string).trim(),self_id:(value.self_id as string).trim(),provider,enabled:value.enabled!==false,permission:permission as AccountConfig['permission'],...(secret?{access_token:secret}:{}),...(typeof value.action_url==='string'&&value.action_url?{action_url:value.action_url}:{})};
-            if(id){const updated=await accountStore.update(id,account);if(!updated)return respond(res,404,{error:{code:'NOT_FOUND',message:'Account not found',retryable:false}});}
+            const auditChange={actor:'admin',action:id?'account.update':'account.create',account_id:accountId,target_type:'account',target_id:accountId,result:'success' as const,metadata:{provider:account.provider,enabled:account.enabled,permission:account.permission}};
+            try{if(id){const updated=await accountStore.update(id,account);if(!updated){if(auditStore)await auditStore.record({...auditChange,result:'failure',metadata:{...auditChange.metadata,error:'Account not found'}});return respond(res,404,{error:{code:'NOT_FOUND',message:'Account not found',retryable:false}});}}
             else {await accountStore.create(account);}
+            if(auditStore)await auditStore.record(auditChange);
+            }catch(error){if(auditStore)await auditStore.record({...auditChange,result:'failure',metadata:{...auditChange.metadata,error:error instanceof Error?error.message:'Storage operation failed'}});throw error;}
             config.accounts=await accountStore.loadConfiguredAccounts();
             const changed=peers.get(accountId);if(changed){changed.socket.close();peers.delete(accountId);}
             return respond(res,id?200:201,{account:{id:account.id,alias:account.alias,self_id:account.self_id,provider:account.provider,enabled:account.enabled,permission:account.permission,access_token_configured:Boolean(secret),connected:false}});
-          }catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid account',retryable:false}});}
+          }catch(error){if(auditStore)await auditStore.record({actor:'admin',action:id?'account.update':'account.create',target_type:'account',target_id:id??null,result:'failure',metadata:{error:error instanceof Error?error.message:'Invalid account'}});return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid account',retryable:false}});}
         }
-        if(req.method==='DELETE'&&id){const removed=await accountStore.remove(id);if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Account not found',retryable:false}});const index=config.accounts.findIndex(a=>a.id===id);if(index>=0)config.accounts.splice(index,1);const peer=peers.get(id);if(peer){peer.socket.close();peers.delete(id);}return respond(res,200,{deleted:true});}
+        if(req.method==='DELETE'&&id){const auditDelete={actor:'admin',action:'account.delete',account_id:id,target_type:'account',target_id:id,result:'success' as const};try{const removed=await accountStore.remove(id);if(!removed){if(auditStore)await auditStore.record({...auditDelete,result:'failure',metadata:{error:'Account not found'}});return respond(res,404,{error:{code:'NOT_FOUND',message:'Account not found',retryable:false}});}if(auditStore)await auditStore.record(auditDelete);}catch(error){if(auditStore)await auditStore.record({...auditDelete,result:'failure',metadata:{error:error instanceof Error?error.message:'Delete failed'}});return respond(res,500,{error:{code:'PERSISTENCE_ERROR',message:'Could not persist account deletion',retryable:true}});}const index=config.accounts.findIndex(a=>a.id===id);if(index>=0)config.accounts.splice(index,1);const peer=peers.get(id);if(peer){peer.socket.close();peers.delete(id);}return respond(res,200,{deleted:true});}
       }
         if (req.method === 'GET' && url.pathname === '/api/admin/priority') {
           if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, {error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
@@ -206,25 +212,25 @@ const peers = new Map<string, Peer>();
           if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
           if(req.method==='GET')return respond(res,200,{rules:(await priorityStore.list()).rules});
           if(req.method==='POST'||req.method==='PUT'){
-            try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be an object');const input=body as RuleRequest;const idInPath=rulePath[1]?decodeURIComponent(rulePath[1]):undefined;const rule=validateRule({...input,...(idInPath?{id:idInPath}:{})});await priorityStore.putRule(rule);activePriorityConfig=await priorityStore.list();return respond(res,req.method==='POST'?201:200,{rule});}
-            catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid rule',retryable:false}});}
+            try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be an object');const input=body as RuleRequest;const idInPath=rulePath[1]?decodeURIComponent(rulePath[1]):undefined;const rule=validateRule({...input,...(idInPath?{id:idInPath}:{})});await priorityStore.putRule(rule);activePriorityConfig=await priorityStore.list();if(auditStore)await auditStore.record({actor:'admin',action:idInPath?'priority.rule.update':'priority.rule.create',target_type:'priority_rule',target_id:rule.id,result:'success',metadata:{enabled:true}});return respond(res,req.method==='POST'?201:200,{rule});}
+            catch(error){if(auditStore)await auditStore.record({actor:'admin',action:'priority.rule.write',result:'failure',metadata:{error:error instanceof Error?error.message:'Invalid rule'}});return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid rule',retryable:false}});}
           }
-          if(req.method==='DELETE'&&rulePath[1]){const removed=await priorityStore.deleteRule(decodeURIComponent(rulePath[1]));if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Rule not found',retryable:false}});activePriorityConfig=await priorityStore.list();return respond(res,200,{deleted:true});}
+        if(req.method==='DELETE'&&rulePath[1]){const id=decodeURIComponent(rulePath[1]);let removed=false;try{removed=await priorityStore.deleteRule(id);if(removed)activePriorityConfig=await priorityStore.list();}catch(error){if(auditStore)await auditStore.record({actor:'admin',action:'priority.rule.delete',target_type:'priority_rule',target_id:id,result:'failure',metadata:{error:error instanceof Error?error.message:'Delete failed'}});return respond(res,500,{error:{code:'PERSISTENCE_ERROR',message:'Could not persist rule deletion',retryable:true}});}if(auditStore)await auditStore.record({actor:'admin',action:'priority.rule.delete',target_type:'priority_rule',target_id:id,result:removed?'success':'failure'});if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Rule not found',retryable:false}});return respond(res,200,{deleted:true});}
         }
         const watchPath=url.pathname.match(/^\/api\/admin\/priority\/watch-people(?:\/([^/]+))?$/);
         if(watchPath){
           if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
           if(req.method==='GET')return respond(res,200,{watchPeople:(await priorityStore.list()).watchPeople});
           if(req.method==='POST'||req.method==='PUT'){
-            try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be an object');const item=validateWatch({...body as Record<string,unknown>,...(watchPath[1]?{id:decodeURIComponent(watchPath[1])}:{})});for(const id of item.accountIds??[])if(!config.accounts.some(a=>a.id===id))throw new Error('Unknown account scope');const saved={id:item.id,userId:item.userId,displayName:item.displayName,enabled:item.enabled,boost:item.boost,...(item.accountIds?{accountIds:item.accountIds}:{})};await priorityStore.putWatchPerson(saved);activePriorityConfig=await priorityStore.list();return respond(res,req.method==='POST'?201:200,{watchPerson:saved});}
+            try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be an object');const item=validateWatch({...body as Record<string,unknown>,...(watchPath[1]?{id:decodeURIComponent(watchPath[1])}:{})});for(const id of item.accountIds??[])if(!config.accounts.some(a=>a.id===id))throw new Error('Unknown account scope');const saved={id:item.id,userId:item.userId,displayName:item.displayName,enabled:item.enabled,boost:item.boost,...(item.accountIds?{accountIds:item.accountIds}:{})};await priorityStore.putWatchPerson(saved);activePriorityConfig=await priorityStore.list();if(auditStore)await auditStore.record({actor:'admin',action:watchPath[1]?'watch_person.update':'watch_person.create',target_type:'watch_person',target_id:item.id,result:'success',metadata:{enabled:item.enabled}});return respond(res,req.method==='POST'?201:200,{watchPerson:saved});}
             catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid watch person',retryable:false}});}
           }
-          if(req.method==='DELETE'&&watchPath[1]){const removed=await priorityStore.deleteWatchPerson(decodeURIComponent(watchPath[1]));if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Watch person not found',retryable:false}});activePriorityConfig=await priorityStore.list();return respond(res,200,{deleted:true});}
+          if(req.method==='DELETE'&&watchPath[1]){const id=decodeURIComponent(watchPath[1]);let removed=false;try{removed=await priorityStore.deleteWatchPerson(id);if(removed)activePriorityConfig=await priorityStore.list();}catch(error){if(auditStore)await auditStore.record({actor:'admin',action:'watch_person.delete',target_type:'watch_person',target_id:id,result:'failure',metadata:{error:error instanceof Error?error.message:'Delete failed'}});return respond(res,500,{error:{code:'PERSISTENCE_ERROR',message:'Could not persist watch-person deletion',retryable:true}});}if(auditStore)await auditStore.record({actor:'admin',action:'watch_person.delete',target_type:'watch_person',target_id:id,result:removed?'success':'failure'});if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Watch person not found',retryable:false}});return respond(res,200,{deleted:true});}
         }
 
       if (req.method === 'GET' && url.pathname === '/api/admin/notifications') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});const value=await notificationStore.get();return respond(res,200,{settings:{...value,webhookSecret:undefined,webhookSecretConfigured:Boolean(value.webhookSecret)}}); }
-      if (req.method === 'PUT' && url.pathname === '/api/admin/notifications') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be object');const input=body as Record<string,unknown>,previous=await notificationStore.get();const enabled=input.enabled===undefined?previous.enabled:input.enabled;const webhookUrl=input.webhookUrl===undefined?previous.webhookUrl:input.webhookUrl;const webhookSecret=input.webhookSecret===undefined?'':input.webhookSecret;const minPriority=input.minPriority??previous.minPriority;const includePreview=input.includePreview===undefined?previous.includePreview:input.includePreview;const timeoutMs=input.timeoutMs??previous.timeoutMs,maxAttempts=input.maxAttempts??previous.maxAttempts;if(typeof enabled!=='boolean'||typeof webhookUrl!=='string'||webhookUrl.length>2048||typeof webhookSecret!=='string'||webhookSecret.length>4096||typeof includePreview!=='boolean'||!['P0','P1','P2','P3','P4'].includes(String(minPriority))||typeof timeoutMs!=='number'||!Number.isInteger(timeoutMs)||timeoutMs<500||timeoutMs>60000||typeof maxAttempts!=='number'||!Number.isInteger(maxAttempts)||maxAttempts<1||maxAttempts>10)throw new Error('Invalid notification settings');if(webhookUrl&&new URL(webhookUrl).protocol!=='https:')throw new Error('Webhook URL must use HTTPS');await notificationStore.put({enabled,webhookUrl,webhookSecret:webhookSecret||previous.webhookSecret,minPriority:minPriority as 'P0'|'P1'|'P2'|'P3'|'P4',includePreview,timeoutMs,maxAttempts});const saved=await notificationStore.get();return respond(res,200,{settings:{...saved,webhookSecret:undefined,webhookSecretConfigured:Boolean(saved.webhookSecret)}});}catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid settings',retryable:false}});} }
-      if (req.method === 'POST' && url.pathname === '/api/admin/notifications/test') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});const value=await notificationStore.get();if(!value.enabled||!value.webhookUrl||!value.webhookSecret)return respond(res,409,{error:{code:'NOTIFICATION_CONFIG_INCOMPLETE',message:'Enable notifications and configure URL/secret',retryable:false}});try{await new HermesWebhookNotifier({url:value.webhookUrl,secret:value.webhookSecret,timeoutMs:value.timeoutMs}).notify({event:'test',account:'admin-console',message_id:null,priority:value.minPriority,sender:'',conversation:'',preview:'',reason:'Admin notification test'});return respond(res,200,{sent:true});}catch(error){return respond(res,502,{error:{code:'NOTIFICATION_TEST_FAILED',message:error instanceof Error?error.message:'Delivery failed',retryable:false}});} }
+      if (req.method === 'PUT' && url.pathname === '/api/admin/notifications') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be object');const input=body as Record<string,unknown>,previous=await notificationStore.get();const enabled=input.enabled===undefined?previous.enabled:input.enabled;const webhookUrl=input.webhookUrl===undefined?previous.webhookUrl:input.webhookUrl;const webhookSecret=input.webhookSecret===undefined?'':input.webhookSecret;const minPriority=input.minPriority??previous.minPriority;const includePreview=input.includePreview===undefined?previous.includePreview:input.includePreview;const timeoutMs=input.timeoutMs??previous.timeoutMs,maxAttempts=input.maxAttempts??previous.maxAttempts;if(typeof enabled!=='boolean'||typeof webhookUrl!=='string'||webhookUrl.length>2048||typeof webhookSecret!=='string'||webhookSecret.length>4096||typeof includePreview!=='boolean'||!['P0','P1','P2','P3','P4'].includes(String(minPriority))||typeof timeoutMs!=='number'||!Number.isInteger(timeoutMs)||timeoutMs<500||timeoutMs>60000||typeof maxAttempts!=='number'||!Number.isInteger(maxAttempts)||maxAttempts<1||maxAttempts>10)throw new Error('Invalid notification settings');if(webhookUrl&&new URL(webhookUrl).protocol!=='https:')throw new Error('Webhook URL must use HTTPS');await notificationStore.put({enabled,webhookUrl,webhookSecret:webhookSecret||previous.webhookSecret,minPriority:minPriority as 'P0'|'P1'|'P2'|'P3'|'P4',includePreview,timeoutMs,maxAttempts});if(auditStore)await auditStore.record({actor:'admin',action:'notification.settings.update',target_type:'notification',target_id:'webhook',result:'success',metadata:{enabled,minPriority,includePreview,timeoutMs,maxAttempts,secretConfigured:Boolean(webhookSecret||previous.webhookSecret)}});const saved=await notificationStore.get();return respond(res,200,{settings:{...saved,webhookSecret:undefined,webhookSecretConfigured:Boolean(saved.webhookSecret)}});}catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid settings',retryable:false}});} }
+      if (req.method === 'POST' && url.pathname === '/api/admin/notifications/test') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});const value=await notificationStore.get();if(!value.enabled||!value.webhookUrl||!value.webhookSecret)return respond(res,409,{error:{code:'NOTIFICATION_CONFIG_INCOMPLETE',message:'Enable notifications and configure URL/secret',retryable:false}});try{await new HermesWebhookNotifier({url:value.webhookUrl,secret:value.webhookSecret,timeoutMs:value.timeoutMs}).notify({event:'test',account:'admin-console',message_id:null,priority:value.minPriority,sender:'',conversation:'',preview:'',reason:'Admin notification test'});if(auditStore)await auditStore.record({actor:'admin',action:'notification.test',target_type:'notification',target_id:'webhook',result:'success'});return respond(res,200,{sent:true});}catch(error){if(auditStore)await auditStore.record({actor:'admin',action:'notification.test',target_type:'notification',target_id:'webhook',result:'failure',metadata:{error:error instanceof Error?error.message:'Delivery failed'}});return respond(res,502,{error:{code:'NOTIFICATION_TEST_FAILED',message:error instanceof Error?error.message:'Delivery failed',retryable:false}});} }
       const contactPath = url.pathname.match(/^\/api\/admin\/accounts\/([^/]+)\/contacts(?:\/(friends|groups|members|sync-friends|sync-groups|sync-members))?$/);
       if (contactPath) {
         if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
@@ -273,9 +279,10 @@ const peers = new Map<string, Peer>();
         const id = typeof body.message_id === 'string' ? body.message_id : '';
         if (!id) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'message_id is required', retryable: false } });
         const state = url.pathname.endsWith('/dismiss') ? await store.dismiss(id) : await store.markProcessed(id);
+        if(auditStore)await auditStore.record({actor:'admin',action:url.pathname.endsWith('/dismiss')?'message.dismiss':'message.process',message_id:id,target_type:'message',target_id:id,result:state?'success':'failure'});
         return state ? respond(res, 200, { state }) : respond(res, 404, { error: { code: 'MESSAGE_NOT_FOUND', message: 'Unknown message', retryable: false } });
       }
-      if (req.method === 'POST' && url.pathname === '/api/messages/revoke') {
+  if (req.method === 'POST' && url.pathname === '/api/messages/revoke') {
         if (!config.apiToken || !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const body = await readBody(req, config.maxMessageBytes) as Record<string, unknown>;
         const account = accountById(config, String(body.account_id ?? ''));
@@ -290,9 +297,11 @@ const peers = new Map<string, Peer>();
         if (!peer || peer.socket.readyState !== WebSocket.OPEN) return respond(res, 503, { error: { code: 'TRANSPORT_UNAVAILABLE', message: 'No connected Reverse WS peer', retryable: true } });
         try {
           const response = await callWsAction(peer, 'delete_msg', { message_id: messageId }, 15000);
+          if(auditStore)await auditStore.record({actor:'admin',action:'message.revoke',account_id:account.id,message_id:known.id,target_type:'message',target_id:String(messageId),result:'success'});
           return respond(res, 200, { status: 'success', action: 'delete_msg', provider_response: response });
         } catch (error) {
           const details = error instanceof Error && 'providerResponse' in error ? (error as Error & { providerResponse: unknown }).providerResponse : undefined;
+          if(auditStore)await auditStore.record({actor:'admin',action:'message.revoke',account_id:account.id,message_id:known.id,target_type:'message',target_id:String(messageId),result:'failure',metadata:{code:'ACTION_FAILED'}});
           return respond(res, 502, { status: 'failed', error: { code: 'ACTION_FAILED', message: error instanceof Error ? error.message : 'Action failed', retryable: false, ...(details === undefined ? {} : { details }) } });
         }
       }
@@ -310,8 +319,9 @@ const peers = new Map<string, Peer>();
           if (existing) return respond(res, 200, { status: 'duplicate', message: existing });
           const outgoing = await onebot.sendMessage(account, type, target, body.message as string | import('./normalize.js').Segment[], clientRequestId);
           sendSuccess++;
+          if(auditStore)await auditStore.record({actor:'admin',action:'message.send',account_id:account.id,message_id:outgoing.id,target_type:type,target_id:target,result:'success'});
           return respond(res, 200, { status: 'sent', message: outgoing });
-        } catch (error) { sendFailure++; const code = (error as { code?: string }).code; return respond(res, code === 'TRANSPORT_UNAVAILABLE' ? 503 : 502, { error: { code: code ?? 'ACTION_FAILED', message: error instanceof Error ? error.message : 'Action failed', retryable: code !== 'ACTION_REJECTED' } }); }
+        } catch (error) { sendFailure++; const code = (error as { code?: string }).code;if(auditStore)await auditStore.record({actor:'admin',action:'message.send',account_id:account.id,target_type:type as string,target_id:target,result:'failure',metadata:{code:code??'ACTION_FAILED'}}); return respond(res, code === 'TRANSPORT_UNAVAILABLE' ? 503 : 502, { error: { code: code ?? 'ACTION_FAILED', message: error instanceof Error ? error.message : 'Action failed', retryable: code !== 'ACTION_REJECTED' } }); }
       }
       return respond(res, 404, { error: { code: 'NOT_FOUND', message: 'Route not found', retryable: false } });
     } catch (error) {
@@ -369,6 +379,7 @@ const peers = new Map<string, Peer>();
       const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
       if (!message) return;
       const result = await store.insert(message); eventCount++; if (!result.inserted) duplicateCount++;
+      if(result.inserted&&auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
       if(result.inserted&&pool)void dispatchNotification(notificationStore,result.message,account);
     });
     socket.on('close', () => { if (peers.get(account.id) === peer) peers.delete(account.id); for (const [key, resolve] of peer.pending) { peer.pending.delete(key); resolve({ error: 'disconnected' }); } logger.warn({ account_id: account.id }, 'OneBot transport disconnected'); });
@@ -376,7 +387,7 @@ const peers = new Map<string, Peer>();
   });
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(config.port, config.host, resolve); });
   logger.info({ host: config.host, port: config.port, accounts: config.accounts.length }, 'Agent OneBot Inbox API started');
-  return { store, peers, accounts: config.accounts, close: async () => { for (const peer of peers.values()) peer.socket.close(); wss.close(); await new Promise<void>(resolve => server.close(() => resolve())); if (pool) await pool.end(); } };
+  return { store, peers, accounts: config.accounts,address:()=>{const value=server.address();return value&&typeof value==='object'?value:null}, close: async () => { for (const peer of peers.values()) peer.socket.close(); wss.close(); await new Promise<void>(resolve => server.close(() => resolve())); if (pool) await pool.end(); } };
 }
 
 function makeOutgoing(account: AccountConfig, requestId: string, externalId: string, type: 'private' | 'group', target: string, content: unknown): NormalizedMessage {
