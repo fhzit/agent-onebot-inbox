@@ -1,27 +1,26 @@
 # Current implementation status
 
-Agent OneBot Inbox is in active incremental development. This repository is not yet the complete product described in the supplied specification.
+Agent OneBot Inbox remains an Alpha under active development, not the complete product in the supplied specification.
 
 ## Implemented and locally verified
 
-- Multi-account config with account/self-ID validation; authenticated HTTP Event and OneBot v11 Reverse WS ingress.
-- Reverse WS shared-route identity resolution, action-response/event echo distinction, basic private/group sends, and in-memory dedup/idempotency.
-- Normalized messages and segment preservation; rule-based priority scorer is injectable into server start and applied to both HTTP and Reverse WS message ingress. User rule persistence/configuration is not implemented.
-- In-memory Inbox state: Agent seen/processed/dismissed is distinct from QQ read; this state is lost on restart.
-- In-memory Inbox query supports account, type, sender, priority, at_me, keyword, since/until and offset/limit, returning total/has_more. MCP inbox list/search use this same query. This is not PostgreSQL FTS.
-- MCP conversation context is target-message centered with before/after window; CLI is a read-only authenticated API client.
-- PostgreSQL migration runner/schema and an async `PostgresMessageStore` repository have fixture/unit coverage. API runtime remains in-memory; migration application and DB failure modes are not live-verified.
-- Attachment metadata helpers and local file-root allowlist/symlink/size checking; no provider download/upload action implemented.
-- Account-scoped contact cache shape and conservative resolver: exact QQ ID or exact nickname/remark/card matching; ambiguous matches return every candidate. This is a foundation only; no contact synchronization or send-route integration exists.
+- Multi-account config validation; authenticated OneBot v11 HTTP Event and Reverse WebSocket ingress; event deduplication.
+- Normalized messages, inbox filters/pagination/context, and Agent processed/dismissed state separate from QQ read state.
+- Authenticated admin UI: account CRUD, encrypted account-token persistence, priority/watch-person controls, notification settings, test delivery, and read-only audit history.
+- Priority rules and watched people persist through `PriorityStore` and affect new-message scoring.
+- Notifications can be configured for Hermes Generic V2, including priority threshold, opt-in preview, timeout, bounded retry count, and signed test delivery. Notification settings persist in PostgreSQL and the webhook secret is encrypted with `ACCOUNT_ENCRYPTION_KEY`. Ingress notification delivery is best-effort and not backed by a durable queue/ledger.
+- PostgreSQL schema/migration runner and async message repository exist. Their unit/fixture coverage is not the same as validating the full live server runtime against PostgreSQL.
+- MCP, read-only CLI, attachment path safety helpers, and conservative contact resolver foundations.
 
 ## Still missing or not verified
 
-- Runtime PostgreSQL wiring for messages/state, Drizzle migrations/integration tests, Redis/BullMQ queues.
-- Provider adapter capability layer and actual NapCat/SnowLuma compatibility, Forward WS and complete HTTP/hybrid Action transports.
-- Contacts/groups/member sync and persistence remain absent; resolver/cache are in-memory foundations and not wired to sends.
-- Self-message revoke is available at the authenticated API route over Reverse WS; HTTP Action revoke and durable action audit are not implemented.
-- Reply, attachment transfer, durable audit trail, atomic external action idempotency.
-- Persisted priority/watch rules, AI classification/task extraction, notification aggregation/digest. A standalone injectable `AgentNotifier` and Hermes Generic V2 signed webhook client now exist with compact allowlisted payload, timeout, and unit coverage; not wired into ingress and no external webhook call has been made. Hermes V2 uses `X-Webhook-Timestamp` and `X-Webhook-Signature-V2` over `<timestamp>.<body>` as HMAC-SHA256 hex. Runtime configuration, endpoint lifecycle, retries, and delivery integration remain unimplemented.
-- Full MCP tool surface, production-ready remote MCP lifecycle, WebUI, Docker end-to-end smoke, backup/restore, 100k-message performance and security review.
+- Provider onboarding and transport lifecycle controls for NapCat/SnowLuma, Forward WS, and complete HTTP/Hybrid Action configuration; account CRUD does not implement reconnect/reprovision lifecycle.
+- Contact, group, and member synchronization/persistence and send-route resolution integration.
+- AI classification, summarization, and task extraction providers/configuration.
+- Notification batching, digests, durable queue, delivery log, and retry persistence.
+- Full write-side audit coverage and append-only audit policy; current UI/API shows only existing audit rows.
+- Attachment transfer, retention/allowlist controls, and end-to-end provider integration.
+- Backup/restore, complete user/role management, full MCP tool coverage, production remote MCP lifecycle, production security/performance review, and real QQ/provider end-to-end verification.
+- Production deployment of recent settings, server encryption-key provisioning, and live migration/application verification.
 
-Run `npm test`, `npm run typecheck`, `npm run build`. Fixture tests do not establish live PostgreSQL, Redis or QQ provider compatibility.
+Database-backed settings require migrations to be applied deliberately before deployment. The webhook setting table is migration `0005_app_settings.sql`. Never infer runtime readiness from unit tests or a successful container build. Inbox processing never sets QQ read state.

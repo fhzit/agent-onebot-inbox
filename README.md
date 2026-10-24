@@ -112,7 +112,15 @@ npm run aoi -- search 报名 --account main
 - Account token values are write-only and never returned by management APIs; PostgreSQL mode encrypts them with AES-256-GCM using the externally supplied `ACCOUNT_ENCRYPTION_KEY` (base64-encoded 32 bytes). Keep this key in the protected runtime environment and back it up separately; losing it makes stored account tokens unrecoverable. Memory mode is volatile. The admin UI keeps its API token in tab memory only. In-memory settings disappear on process restart.
 - The admin page build parses inline JavaScript with Node during typecheck/build; tests extract the served HTML and verify script syntax.
 
-This is still Alpha, not a production-ready administration suite: full provider onboarding and transport lifecycle, user/role management, backups/restore, full audit coverage, and direct QQ read are not provided in the web UI. Do not expose an API token to untrusted users. Status actions never mark messages read on QQ.
+## Still missing or unverified
+
+- Full provider onboarding and transport lifecycle; contact/group/member synchronization; AI classification, summarization, and task extraction.
+- Notification batching/digests, durable delivery queue and delivery log. Current Hermes V2 webhook settings/integration are best-effort only.
+- Complete write-side audit coverage and append-only audit policy; current admin audit view is read-only over existing rows.
+- Attachment transfer/retention controls; backup and restore; user/role management; complete MCP surface and production remote MCP lifecycle.
+- Live PostgreSQL runtime/migration/restart verification, real QQ/NapCat/SnowLuma delivery, production security review, load testing, and deployment of recent admin changes.
+
+Keep the Alpha/non-production-ready warning. Do not describe a feature as complete without its configuration UI, authenticated API, persistence, runtime effect, and tests.
 
 
 The GitHub Actions workflow tests pull requests and builds the container image without publishing it. Pushes to `main` publish `ghcr.io/fhzit/agent-onebot-inbox:main`; version-tag pushes (`v*`) publish the corresponding version tag. The workflow also publishes branch/tag and `sha-...` tags for pushed refs. GHCR packages may initially be private: set package visibility to **Public** in the package's GitHub settings after its first successful push if unauthenticated pulls are intended. `GITHUB_TOKEN` can publish only with repository Actions package-write permission and package access; it does not make package visibility public automatically.
