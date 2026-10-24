@@ -22,6 +22,9 @@ The console also has a read-only audit-history table backed by authenticated `GE
 - `GET|PUT /api/admin/notifications`: authenticated; manages the Hermes V2 webhook URL, write-only secret, priority threshold, preview policy, timeout, and retry count. `POST /api/admin/notifications/test` performs a real test delivery. Delivery is best-effort; no durable queue/ledger yet.
 - `GET /api/admin/priority`: authenticated; reads priority rules and watched people.
 - `POST|PUT|DELETE /api/admin/priority/rules[/:id]` and `/api/admin/priority/watch-people[/:id]`: authenticated CRUD; changes apply to newly received events immediately. PostgreSQL mode persists them; memory mode is volatile.
+- `GET /api/admin/accounts/:id/contacts[/friends|groups|members]`: authenticated per-account contact snapshot; friend/group endpoints support `limit` and signed account-bound `cursor` pagination.
+- `POST /api/admin/accounts/:id/contacts/sync-friends` and `/sync-groups`: manually fetch OneBot friend/group lists and replace their stored snapshots.
+- `POST /api/admin/accounts/:id/contacts/sync-members` with `{group_id}`: refresh one group's member snapshot. Sync status timestamps are included in the snapshot. These actions do not mark QQ messages read.
 - `POST /mcp`: Streamable HTTP MCP, API bearer token. Includes inbox read/search/context/status plus Agent state mark/dismiss tools.
 
 `message_id` accepts an integer JSON number or a base-10 integer string that fits signed int32; exponent, decimal, and out-of-range forms are rejected.

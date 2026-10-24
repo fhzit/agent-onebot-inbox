@@ -64,6 +64,10 @@ test('serves a local admin UI without embedding secrets or external assets', asy
     assert.match(html, /auditRows/);
     assert.match(html, /loadAudit/);
     assert.match(html, /api\/admin\/audit/);
+    assert.match(html, /contactSyncForm/);
+    assert.match(html, /sync-friends/);
+    assert.match(html, /sync-groups/);
+    assert.match(html, /sync-members/);
     assert.match(html, /data-tab="settings"/);
     assert.match(html, /settingsDatabase/);
     assert.match(html, /settingsAccounts/);

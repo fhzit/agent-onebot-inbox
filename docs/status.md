@@ -8,6 +8,7 @@ Agent OneBot Inbox remains an Alpha under active development, not the complete p
 - Normalized messages, inbox filters/pagination/context, and Agent processed/dismissed state separate from QQ read state.
 - Authenticated admin UI: account CRUD, encrypted account-token persistence, priority/watch-person controls, notification settings, test delivery, and read-only audit history.
 - Priority rules and watched people persist through `PriorityStore` and affect new-message scoring.
+- Contact sync: authenticated per-account manual sync of OneBot friend/group/member lists, PostgreSQL snapshot persistence with per-account isolation, sync timestamps, in-memory contact resolver refresh, and signed account-bound cursors for friend/group listing. Sync does not mark QQ messages read.
 - Notifications can be configured for Hermes Generic V2, including priority threshold, opt-in preview, timeout, bounded retry count, and signed test delivery. Notification settings persist in PostgreSQL and the webhook secret is encrypted with `ACCOUNT_ENCRYPTION_KEY`. Ingress notification delivery is best-effort and not backed by a durable queue/ledger.
 - PostgreSQL schema/migration runner and async message repository exist. Their unit/fixture coverage is not the same as validating the full live server runtime against PostgreSQL.
 - MCP, read-only CLI, attachment path safety helpers, and conservative contact resolver foundations.
@@ -15,7 +16,7 @@ Agent OneBot Inbox remains an Alpha under active development, not the complete p
 ## Still missing or not verified
 
 - Provider onboarding and transport lifecycle controls for NapCat/SnowLuma, Forward WS, and complete HTTP/Hybrid Action configuration; account CRUD does not implement reconnect/reprovision lifecycle.
-- Contact, group, and member synchronization/persistence and send-route resolution integration.
+- Send-route resolution through synchronized contacts; contact search/edit APIs and platform change/member-role event sync.
 - AI classification, summarization, and task extraction providers/configuration.
 - Notification batching, digests, durable queue, delivery log, and retry persistence.
 - Full write-side audit coverage and append-only audit policy; current UI/API shows only existing audit rows.

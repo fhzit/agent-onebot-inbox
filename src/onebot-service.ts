@@ -9,6 +9,7 @@ export interface ActionResult { status: 'ok' | 'failed' | 'timeout' | 'unsupport
 export interface OneBotGateway {
   sendMessage(account: AccountConfig, type: 'private' | 'group', target: string, message: string | Segment[], requestId: string): Promise<NormalizedMessage>;
   revokeMessage(account: AccountConfig, externalMessageId: string): Promise<ActionResult>;
+  callApi(account: AccountConfig, action: string, params: Record<string, unknown>): Promise<unknown>;
 }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === 'object' ? value as Record<string, unknown> : {}; }
 function outgoing(account: AccountConfig, requestId: string, externalId: string, type: 'private' | 'group', target: string, content: string | Segment[]): NormalizedMessage {
@@ -50,6 +51,12 @@ export class OneBotService implements OneBotGateway {
     if (!peer || peer.socket.readyState !== 1) return { status: 'timeout', action: 'delete_msg', error: 'No active Reverse WebSocket connection' };
     try { const response = await this.call(peer, 'delete_msg', { message_id: externalMessageId }); return { status: 'ok', action: 'delete_msg', response }; }
     catch (error) { return { status: 'failed', action: 'delete_msg', error: error instanceof Error ? error.message : 'Action failed' }; }
+  }
+  async callApi(account:AccountConfig,action:string,params:Record<string,unknown>):Promise<unknown>{
+    const peer=this.peers.get(account.id);
+    if(peer?.socket.readyState===1)return this.call(peer,action,params);
+    if(account.action_url){const url=account.action_url.endsWith('/')?`${account.action_url}${action}`:`${account.action_url}/${action}`;const headers:Record<string,string>={'content-type':'application/json'};if(account.access_token)headers.authorization=`Bearer ${account.access_token}`;const response=await fetch(url,{method:'POST',headers,body:JSON.stringify(params),signal:AbortSignal.timeout(this.timeoutMs)});if(!response.ok)throw Object.assign(new Error(`HTTP OneBot action returned ${response.status}`),{code:'ACTION_FAILED'});const value=await response.json();const result=record(value);if(result.status!=='ok'||Number(result.retcode)!==0)throw Object.assign(new Error('OneBot action rejected'),{code:'ACTION_REJECTED'});return value;}
+    throw Object.assign(new Error('No active Reverse WebSocket connection or HTTP action_url'),{code:'TRANSPORT_UNAVAILABLE'});
   }
   private call(peer: PeerLike, action: string, params: unknown): Promise<unknown> {
     return new Promise((resolve, reject) => {

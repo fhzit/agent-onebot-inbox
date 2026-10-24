@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 );
 CREATE TABLE IF NOT EXISTS contacts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-  qq_id text NOT NULL, nickname text, remark text, avatar text, metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  qq_id text NOT NULL, nickname text, remark text, avatar text, contact_type text NOT NULL DEFAULT 'friend', metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
   last_synced_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), UNIQUE(account_id,qq_id)
 );
 CREATE TABLE IF NOT EXISTS group_members (
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS watch_people (
 );
 CREATE TABLE IF NOT EXISTS watch_groups (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), account_scope jsonb NOT NULL, group_id text NOT NULL, name text,
-  enabled boolean NOT NULL DEFAULT true, notify_mode text NOT NULL DEFAULT 'digest', priority_boost integer NOT NULL DEFAULT 0,
+  enabled boolean NOT NULL DEFAULT true, scope text NOT NULL DEFAULT 'global', notify_mode text NOT NULL DEFAULT 'digest', priority_boost integer NOT NULL DEFAULT 0,
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS priority_rules (

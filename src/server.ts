@@ -20,8 +20,12 @@ import { HermesWebhookNotifier, type AgentNotification } from './agent-notifier.
 import { MemoryNotificationConfigStore, PostgresNotificationConfigStore, type NotificationConfigStore } from './notification-settings.js';
 import { RuntimeOneBotService } from './runtime-onebot-service.js';
 import { adminPage } from './admin-page.js';
+import {ContactsCache} from './contacts-cache.js';
+import {ContactSyncService} from './contact-sync.js';
+import {PostgresContactsStore,type ContactsStore, type ContactsSnapshot} from './postgres-contacts-store.js';
 
 export type Peer = { account: AccountConfig; socket: WebSocket; connectedAt: number; pending: Map<string, (value: unknown) => void> };
+class MemoryContactsStore implements ContactsStore{private snapshots=new Map<string,ContactsSnapshot>();async get(id:string){return structuredClone(this.snapshots.get(id)??{friends:[],groups:[],members:[],last_synced:{friends:null,groups:null,members:{}}});}async replaceFriends(id:string,rows:readonly import('./contacts-cache.js').Friend[],syncedAt=new Date()){const s=await this.get(id);s.friends=[...rows];s.last_synced.friends=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroups(id:string,rows:readonly import('./contacts-cache.js').Group[],syncedAt=new Date()){const s=await this.get(id);s.groups=[...rows];s.last_synced.groups=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroupMembers(id:string,groupId:string|number,rows:readonly import('./contacts-cache.js').GroupMember[],syncedAt=new Date()){const s=await this.get(id);s.members=s.members.filter(x=>x.group_id!==String(groupId));s.members.push({group_id:String(groupId),members:[...rows]});s.last_synced.members[String(groupId)]=syncedAt.toISOString();this.snapshots.set(id,s);}}
 export type Runtime = { close: () => Promise<void>; store: MessageStore | PostgresMessageStore; peers: Map<string, Peer>; accounts: AccountConfig[] };
 type Logger = { info: (data: unknown, message?: string) => void; warn: (data: unknown, message?: string) => void; error: (data: unknown, message?: string) => void };
 const logger: Logger = {
@@ -122,6 +126,9 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   if (config.accounts.some(a => a.enabled && !a.access_token)) throw new Error('Every enabled account requires access_token');
 const peers = new Map<string, Peer>();
   const onebot = new RuntimeOneBotService(peers, store);
+  const contactsCache=new ContactsCache();
+  const contactsStore:ContactsStore=pool?new PostgresContactsStore(pool):new MemoryContactsStore();
+  const contactSync=new ContactSyncService(onebot,contactsCache,contactsStore,options.accountEncryptionKey??config.apiToken);
   let eventCount = 0; let duplicateCount = 0; let sendSuccess = 0; let sendFailure = 0;
   const server = createServer();
   const appHandler = async (req: IncomingMessage, res: ServerResponse) => {
@@ -216,7 +223,33 @@ const peers = new Map<string, Peer>();
       if (req.method === 'GET' && url.pathname === '/api/admin/notifications') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});const value=await notificationStore.get();return respond(res,200,{settings:{...value,webhookSecret:undefined,webhookSecretConfigured:Boolean(value.webhookSecret)}}); }
       if (req.method === 'PUT' && url.pathname === '/api/admin/notifications') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be object');const input=body as Record<string,unknown>,previous=await notificationStore.get();const enabled=input.enabled===undefined?previous.enabled:input.enabled;const webhookUrl=input.webhookUrl===undefined?previous.webhookUrl:input.webhookUrl;const webhookSecret=input.webhookSecret===undefined?'':input.webhookSecret;const minPriority=input.minPriority??previous.minPriority;const includePreview=input.includePreview===undefined?previous.includePreview:input.includePreview;const timeoutMs=input.timeoutMs??previous.timeoutMs,maxAttempts=input.maxAttempts??previous.maxAttempts;if(typeof enabled!=='boolean'||typeof webhookUrl!=='string'||webhookUrl.length>2048||typeof webhookSecret!=='string'||webhookSecret.length>4096||typeof includePreview!=='boolean'||!['P0','P1','P2','P3','P4'].includes(String(minPriority))||typeof timeoutMs!=='number'||!Number.isInteger(timeoutMs)||timeoutMs<500||timeoutMs>60000||typeof maxAttempts!=='number'||!Number.isInteger(maxAttempts)||maxAttempts<1||maxAttempts>10)throw new Error('Invalid notification settings');if(webhookUrl&&new URL(webhookUrl).protocol!=='https:')throw new Error('Webhook URL must use HTTPS');await notificationStore.put({enabled,webhookUrl,webhookSecret:webhookSecret||previous.webhookSecret,minPriority:minPriority as 'P0'|'P1'|'P2'|'P3'|'P4',includePreview,timeoutMs,maxAttempts});const saved=await notificationStore.get();return respond(res,200,{settings:{...saved,webhookSecret:undefined,webhookSecretConfigured:Boolean(saved.webhookSecret)}});}catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid settings',retryable:false}});} }
       if (req.method === 'POST' && url.pathname === '/api/admin/notifications/test') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});const value=await notificationStore.get();if(!value.enabled||!value.webhookUrl||!value.webhookSecret)return respond(res,409,{error:{code:'NOTIFICATION_CONFIG_INCOMPLETE',message:'Enable notifications and configure URL/secret',retryable:false}});try{await new HermesWebhookNotifier({url:value.webhookUrl,secret:value.webhookSecret,timeoutMs:value.timeoutMs}).notify({event:'test',account:'admin-console',message_id:null,priority:value.minPriority,sender:'',conversation:'',preview:'',reason:'Admin notification test'});return respond(res,200,{sent:true});}catch(error){return respond(res,502,{error:{code:'NOTIFICATION_TEST_FAILED',message:error instanceof Error?error.message:'Delivery failed',retryable:false}});} }
-        if (req.method === 'GET' && url.pathname === '/api/admin/audit') {
+      const contactPath = url.pathname.match(/^\/api\/admin\/accounts\/([^/]+)\/contacts(?:\/(friends|groups|members|sync-friends|sync-groups|sync-members))?$/);
+      if (contactPath) {
+        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        const account = accountById(config, decodeURIComponent(contactPath[1]!));
+        if (!account) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown account', retryable: false } });
+        try {
+          const operation = contactPath[2];
+          if (req.method === 'POST' && operation === 'sync-friends') return respond(res, 200, await contactSync.syncFriends(account));
+          if (req.method === 'POST' && operation === 'sync-groups') return respond(res, 200, await contactSync.syncGroups(account));
+          if (req.method === 'POST' && operation === 'sync-members') {
+            const body = await readBody(req, config.maxMessageBytes) as Record<string, unknown>;
+            if ((typeof body.group_id !== 'string' && !Number.isSafeInteger(body.group_id)) || String(body.group_id).length === 0) throw Object.assign(new Error('group_id is required'), { code: 'VALIDATION_ERROR' });
+            return respond(res, 200, await contactSync.syncMembers(account, String(body.group_id)));
+          }
+          if (req.method === 'GET' && (operation === 'friends' || operation === 'groups')) {
+            const limit = Number(url.searchParams.get('limit') ?? 50);
+            if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw Object.assign(new Error('Invalid limit'), { code: 'VALIDATION_ERROR' });
+            const cursor = url.searchParams.get('cursor');
+            return respond(res, 200, operation === 'friends' ? await contactSync.pageFriends(account.id, cursor, limit) : await contactSync.pageGroups(account.id, cursor, limit));
+          }
+          if (req.method === 'GET' && (operation === 'members' || !operation)) return respond(res, 200, await contactsStore.get(account.id));
+          return respond(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Unsupported contacts operation', retryable: false } });
+        } catch (error) {
+          return respond(res, 400, { error: { code: error instanceof Error && 'code' in error ? String((error as Error & { code: string }).code) : 'CONTACT_SYNC_FAILED', message: error instanceof Error ? error.message : 'Contact sync failed', retryable: false } });
+        }
+      }
+      if (req.method === 'GET' && url.pathname === '/api/admin/audit') {
         if (!safeTokenEqual(config.apiToken,bearer(req))) return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
         const limit=Number(url.searchParams.get('limit')??50),offset=Number(url.searchParams.get('offset')??0);
         if(!Number.isInteger(limit)||limit<1||limit>100||!Number.isInteger(offset)||offset<0)return respond(res,400,{error:{code:'VALIDATION_ERROR',message:'Invalid audit pagination',retryable:false}});
