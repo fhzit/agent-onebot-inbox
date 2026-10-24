@@ -7,6 +7,13 @@ import { startServer } from '../src/server.js';
 
 const account = { id: 'main', alias: 'Main', self_id: '10001', provider: 'napcat', enabled: true, access_token: 'transport-secret', permission: 'direct' as const };
 
+test('admin message renderer replaces the login placeholder after messages load', async () => {
+  const { adminPage } = await import('../src/admin-page.js');
+  const script = adminPage.slice(adminPage.indexOf('<script>') + 8, adminPage.indexOf('</script>'));
+  assert.ok(script.includes("function renderMessages(messages){"));
+  assert.match(script.slice(script.indexOf('function renderMessages(messages){'), script.indexOf('async function action(')), /\$\('messages'\)\.innerHTML=/);
+});
+
 test('admin embedded script parses successfully', async () => {
   const { adminPage } = await import('../src/admin-page.js');
   const script = adminPage.slice(adminPage.indexOf('<script>') + 8, adminPage.indexOf('</script>'));
