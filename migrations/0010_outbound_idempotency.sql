@@ -10,3 +10,6 @@ CREATE TABLE IF NOT EXISTS outbound_idempotency (
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (account_id, client_request_id)
 );
+
+-- Runtime application role: grant only the table operations used by the store.
+GRANT SELECT, INSERT, UPDATE ON TABLE outbound_idempotency TO aoi_app;

@@ -38,3 +38,31 @@ test('lifecycle resets failures on success and close cancels pending retry', () 
   lifecycle.start();
   assert.equal(attempts, 2);
 });
+
+test('lifecycle handles a schedule callback invoked synchronously', () => {
+  let attempts = 0;
+  const lifecycle = createReconnectLifecycle({
+    schedule(callback) { callback(); return () => {}; },
+    connect() { attempts++; },
+    delayOptions: { baseDelayMs: 1, maxDelayMs: 1, jitterRatio: 0 },
+  });
+  lifecycle.failed();
+  lifecycle.failed();
+  assert.equal(attempts, 2);
+});
+
+test('connected cancels and invalidates a pending retry', () => {
+  let callback!: () => void;
+  let cancelled = false;
+  let attempts = 0;
+  const lifecycle = createReconnectLifecycle({
+    schedule(cb) { callback = cb; return () => { cancelled = true; }; },
+    connect() { attempts++; },
+    delayOptions: { baseDelayMs: 1, maxDelayMs: 1, jitterRatio: 0 },
+  });
+  lifecycle.failed();
+  lifecycle.connected();
+  callback();
+  assert.equal(cancelled, true);
+  assert.equal(attempts, 0);
+});

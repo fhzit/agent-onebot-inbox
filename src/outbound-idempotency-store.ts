@@ -52,7 +52,9 @@ export class PostgresOutboundIdempotencyStore {
       await client.query('COMMIT');
       return { created, record: { accountId: String(row.account_id), requestId: String(row.client_request_id), messageType: row.message_type as 'private' | 'group', targetId: String(row.target_id), payload: row.payload, state: row.state as 'pending' | 'complete', response: row.response ?? null } };
     } catch (error) {
-      await client.query('ROLLBACK');
+      // A failed COMMIT may have succeeded on the server; rollback is best-effort and
+      // cannot establish the transaction outcome. Preserve the original error.
+      try { await client.query('ROLLBACK'); } catch { /* outcome remains uncertain */ }
       throw error;
     } finally { client.release(); }
   }
@@ -60,11 +62,22 @@ export class PostgresOutboundIdempotencyStore {
   async complete(accountId: string, requestId: string, response: unknown): Promise<void> {
     const client = await this.pool.connect();
     try {
-      await client.query(
+      const result = await client.query(
         `UPDATE outbound_idempotency SET state='complete',response=$3::jsonb,updated_at=now()
          WHERE account_id=$1 AND client_request_id=$2 AND state='pending'`,
         [accountId, requestId, canonical(response)]
       );
+      if (result.rowCount == null) throw new Error('Database did not report idempotency completion row count');
+      if (result.rowCount === 0) {
+        const existing = await client.query<Record<string, unknown>>(
+          `SELECT state,response FROM outbound_idempotency WHERE account_id=$1 AND client_request_id=$2`,
+          [accountId, requestId]
+        );
+        const row = existing.rows[0];
+        if (row?.state === 'complete' && canonical(row.response) === canonical(response)) return;
+        throw new Error(row ? 'Idempotency record is not pending or response differs' : 'Idempotency record not found');
+      }
+      if (result.rowCount !== 1) throw new Error(`Expected to complete one idempotency record; updated ${result.rowCount}`);
     } finally { client.release(); }
   }
 }

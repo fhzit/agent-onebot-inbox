@@ -32,13 +32,26 @@ export function createReconnectLifecycle(options: ReconnectLifecycleOptions) {
       if (closed || cancelPending) return;
       const ticket = ++generation;
       const delay = reconnectDelayMs(failures++, options.delayOptions, options.random);
-      cancelPending = options.schedule(() => {
+      let fired = false;
+      let synchronous = true;
+      const cancel = options.schedule(() => {
+        fired = true;
         if (closed || ticket !== generation) return;
         cancelPending = undefined;
+        if (synchronous) return;
         startAttempt();
       }, delay);
+      synchronous = false;
+      // schedule implementations may invoke callbacks before returning the canceler.
+      if (!fired && ticket === generation && !closed) cancelPending = cancel;
+      else if (fired && ticket === generation && !closed) startAttempt();
     },
-    connected() { failures = 0; },
+    connected() {
+      failures = 0;
+      generation++;
+      cancelPending?.();
+      cancelPending = undefined;
+    },
     close() {
       if (closed) return;
       closed = true;
