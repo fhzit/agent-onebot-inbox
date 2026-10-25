@@ -16,7 +16,7 @@ NapCat / SnowLuma
         ▼
   Inbox API + normalizer ── MCP / CLI ── AI Agent
         │
-        └── 当前 runtime store：内存（非持久化）
+        └── 当前 runtime store：PostgreSQL（配置 DATABASE_URL 时）；否则内存（非持久化）
 ```
 
 核心模型按账号隔离。账号或联系人目标不明确时不应猜测；Agent 处理状态与 QQ 平台已读状态分开。
@@ -30,7 +30,9 @@ NapCat / SnowLuma
 - Inbox 查询过滤与分页、上下文查询、Agent 处理/忽略状态。读取和更新 Agent 状态不会触发 QQ 标记已读。
 - MCP TypeScript SDK（stdio 与 Streamable HTTP）、只读 API CLI。
 - PostgreSQL schema、migration runner 和 runtime message/Inbox repository 已接线；当前生产容器已通过数据库连接 readiness。备份恢复及真实 provider 行为仍未验证。
-- Hermes Generic V2 通知客户端原型，带签名与精简字段；尚未接入事件处理流程。
+- Hermes Generic V2 通知能力使用有界同步重试、尽力投递；新增 PostgreSQL 通知队列存储与 migration 尚未接入 runtime，不能视为已启用的持久队列。
+- PostgreSQL outbound idempotency 已接入发送 runtime（仅 PostgreSQL 模式）；pending/uncertain 请求会阻止自动重试，但不提供 exactly-once 保证。生产/live-provider 行为尚未验收。
+- Provider lifecycle controller 与 OneBot `get_file` 适配、安全本地附件检索 helper 有实现及 fixture 测试；前者未接入生产传输，后者没有 authenticated API route。
 
 详见[实现状态与未完成项](docs/status.md)。这不是 NapCat/SnowLuma 完整适配声明；各 provider 的真实兼容性尚未实测。
 
@@ -119,9 +121,9 @@ npm run aoi -- search 报名 --account main
 - Full NapCat/SnowLuma onboarding, provider capability compatibility, and automatic transport lifecycle/reconnect.
 - Contact-aware send-route resolution, contact search/edit, and contact change/member-role event sync.
 - AI classification, summaries, and task extraction.
-- Durable notification queue, batching/digests, delivery ledger, and retry persistence.
+- Runtime-wired durable notification queue/worker, batching/digests, and queue retry lifecycle. Queue store/helper and migration `0011_notification_queue.sql` exist, but are not runtime wired and migration `0011` has not been tested against a live database. The separately wired delivery history is not a queue.
 - Audit rows are written to PostgreSQL for sensitive admin actions; API exposure remains read-only. The application role cannot update/delete/truncate audit rows. This does not protect against database-owner tampering, and deployment currently uses a shared application DB role; an independently administered audit sink and retention policy are not implemented.
-- Attachment upload/download, backup/restore drill, user-role management, and full MCP tools/remote transport lifecycle.
+- Authenticated attachment retrieval route/upload, backup/restore drill, user-role management, and full MCP tools/remote transport lifecycle. The `get_file` adapter and sandboxed local-file retrieval helper are not exposed through an authenticated route.
 - Real QQ/provider end-to-end, security/load tests, and publicly reachable Cloudflare route validation.
 
 This is still Alpha, not a complete product or production-ready service.
@@ -155,7 +157,7 @@ npm audit --omit=dev
 
 ## 路线图（概览）
 
-- 将 PostgreSQL 持久化接入 runtime，并测试迁移、备份与恢复。
+- 完成 PostgreSQL 持久化的生产验证，并测试迁移、备份与恢复；outbound idempotency 当前已在 PostgreSQL send runtime 接线，但不保证 exactly-once。
 - 建立 provider capability/adapter 层并对 NapCat、SnowLuma 做真实兼容性验证。
 - 补齐 Forward WS、HTTP Action、联系人与历史同步、附件传输和持久化审计。
 - 完善可恢复的队列、通知/Webhook 生命周期、CLI 未读语义与 Web UI。

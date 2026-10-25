@@ -5,6 +5,10 @@ import path from 'node:path';
 export type ProviderFileRetriever = (providerFileId: string) => Promise<string>;
 export type RetrievedAttachment = { bytes: Buffer; filename: string; size: number };
 
+export function assertSupportedAttachmentPlatform(platform: string = process.platform): void {
+  if (platform !== 'linux') throw new Error('Attachment retrieval is supported on Linux only');
+}
+
 function isWithinRoot(file: string, roots: readonly string[]): boolean {
   return roots.some(root => {
     const relative = path.relative(root, file);
@@ -19,8 +23,10 @@ export async function retrieveAttachment(
   allowedRoots: readonly string[],
   maxBytes: number,
 ): Promise<RetrievedAttachment> {
+  assertSupportedAttachmentPlatform();
   if (typeof providerFileId !== 'string' || providerFileId.trim().length === 0) throw new Error('Provider file ID is required');
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new Error('Invalid file size limit');
+  if (typeof retrieveProviderPath !== 'function') throw new Error('Provider file retriever is required');
   const providerPath = await retrieveProviderPath(providerFileId);
   if (!path.isAbsolute(providerPath)) throw new Error('File path must be absolute');
   const roots = await Promise.all(allowedRoots.map(root => realpath(root)));

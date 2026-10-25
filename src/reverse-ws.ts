@@ -24,3 +24,61 @@ export function classifyActionResponse(packet: unknown, expectedEcho: string): b
     && (value.status === 'ok' || value.status === 'failed')
     && typeof value.retcode === 'number';
 }
+
+import { createProviderLifecycle } from './provider-lifecycle.js';
+
+/** Owns one outbound Reverse WS socket and applies the shared reconnect policy. */
+export function createManagedReverseWsClient<T extends { close: () => void }>(options: {
+  connect: (events: { connected: () => void; failed: () => void }) => T;
+  schedule: (callback: () => void, delayMs: number) => () => void;
+  delayOptions?: import('./provider-reconnect-policy.js').DelayOptions;
+  random?: () => number;
+}) {
+  let socket: T | undefined;
+  let closed = false;
+  let generation = 0;
+  const lifecycle = createProviderLifecycle({
+    schedule: options.schedule,
+    ...(options.delayOptions ? { delayOptions: options.delayOptions } : {}),
+    ...(options.random ? { random: options.random } : {}),
+    connect(events) {
+      const attempt = ++generation;
+      let candidate: T | undefined;
+      try {
+        candidate = options.connect({
+          connected() {
+            if (!candidate) return;
+            if (closed || attempt !== generation) { candidate.close(); return; }
+            const prior = socket;
+            socket = candidate;
+            events.connected();
+            if (prior && prior !== candidate) prior.close();
+          },
+          failed() {
+            if (closed || attempt !== generation) return;
+            if (socket === candidate) socket = undefined;
+            candidate?.close();
+            events.failed();
+          },
+        });
+      } catch {
+        events.failed();
+        return;
+      }
+    },
+  });
+  return {
+    start() { if (!closed) lifecycle.start(); },
+    close() {
+      if (closed) return;
+      closed = true;
+      generation++;
+      lifecycle.close();
+      const active = socket;
+      socket = undefined;
+      active?.close();
+    },
+    get currentSocket() { return socket; },
+    get isClosed() { return closed; },
+  };
+}

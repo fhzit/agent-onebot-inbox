@@ -45,6 +45,7 @@ export class MessageStore {
     return { unread: incoming && !saved?.seen_by_agent, seen_by_agent: saved?.seen_by_agent ?? false, processed: saved?.processed ?? false, dismissed: saved?.dismissed ?? false, qq_read: false };
   }
   markSeen(id: string): InboxState | undefined { return this.updateState(id, { seen_by_agent: true }); }
+  markAllSeen(): number { let updated=0; for (const message of this.#byId.values()) if(message.direction==='incoming'&&this.state(message.id)?.unread){this.updateState(message.id,{seen_by_agent:true});updated++;} return updated; }
   markProcessed(id: string): InboxState | undefined { return this.updateState(id, { seen_by_agent: true, processed: true }); }
   dismiss(id: string): InboxState | undefined { return this.updateState(id, { seen_by_agent: true, dismissed: true }); }
   private updateState(id: string, update: Partial<Omit<InboxState, 'unread' | 'qq_read'>>): InboxState | undefined {
