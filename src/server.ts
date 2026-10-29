@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { Pool } from 'pg';
 import { PostgresMessageStore } from './postgres-store.js';
 import { classifyActionResponse, resolveReverseWsAccount } from './reverse-ws.js';
+import { createProviderSessionLiveness } from './provider-session-liveness.js';
 import { applyPriority, type PriorityConfig } from './priority.js';
 import { MemoryPriorityStore, PostgresPriorityStore, type PriorityStore } from './priority-store.js';
 import { MemoryAccountStore, PostgresAccountStore, type AccountStore } from './account-store.js';
@@ -26,11 +27,19 @@ import { adminPage } from './admin-page.js';
 import {ContactsCache} from './contacts-cache.js';
 import {resolveContact} from './contact-resolver.js';
 import {ContactSyncService} from './contact-sync.js';
+import { mapContactChangeEvent } from './contact-change-events.js';
 import {PostgresContactsStore,type ContactsStore, type ContactsSnapshot} from './postgres-contacts-store.js';
 import { PostgresNotificationQueue } from './notification-queue.js';
+import { PostgresMessageNotificationOutbox } from './message-notification-outbox.js';
 import { NotificationWorker } from './notification-worker.js';
+import { NotificationDigestWorker } from './notification-digest-worker.js';
+import type { NotificationDigest } from './notification-digest.js';
+import { applyInboxRules, type InboxRule } from './inbox-rules.js';
+import { MemoryInboxRulesStore, PostgresInboxRulesStore, type InboxRulesStore } from './inbox-rules-store.js';
 import { createAttachmentRouteHandler } from './attachments/routes.js';
 import { createOneBotFileRetriever } from './attachments/provider-adapter.js';
+import { PostgresHistoryReconciliationAudit } from './history-reconciliation-audit.js';
+import { getProviderCapabilities } from './provider-capabilities.js';
 
 export type Peer = { account: AccountConfig; socket: WebSocket; connectedAt: number; pending: Map<string, (value: unknown) => void> };
 class MemoryContactsStore implements ContactsStore{private snapshots=new Map<string,ContactsSnapshot>();async get(id:string){return structuredClone(this.snapshots.get(id)??{friends:[],groups:[],members:[],last_synced:{friends:null,groups:null,members:{}}});}async search(accountId:string,query:string,limit=50){const snapshot=await this.get(accountId);const contacts:import('./contact-resolver.js').Contact[]=[...snapshot.friends.map(f=>({account_id:accountId,qq_id:String(f.user_id),...(f.nickname!==undefined?{nickname:f.nickname}:{}),...(f.remark!==undefined?{remark:f.remark}:{})})),...snapshot.members.flatMap(g=>g.members.map(m=>({account_id:accountId,qq_id:String(m.user_id),...(m.nickname!==undefined?{nickname:m.nickname}:{}),...(m.card!==undefined?{card:m.card}:{}),group_id:g.group_id})))];const result=resolveContact(contacts,accountId,query);return{...result,results:result.candidates.slice(0,Math.min(100,Math.max(1,limit)))};}async replaceFriends(id:string,rows:readonly import('./contacts-cache.js').Friend[],syncedAt=new Date()){const s=await this.get(id);s.friends=[...rows];s.last_synced.friends=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroups(id:string,rows:readonly import('./contacts-cache.js').Group[],syncedAt=new Date()){const s=await this.get(id);s.groups=[...rows];s.last_synced.groups=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroupMembers(id:string,groupId:string|number,rows:readonly import('./contacts-cache.js').GroupMember[],syncedAt=new Date()){const s=await this.get(id);s.members=s.members.filter(x=>x.group_id!==String(groupId));s.members.push({group_id:String(groupId),members:[...rows]});s.last_synced.members[String(groupId)]=syncedAt.toISOString();this.snapshots.set(id,s);}}
@@ -52,6 +61,23 @@ function respond(res: ServerResponse, code: number, body: unknown): void {
   res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(body));
 }
 function safeTokenEqual(a:string,b:string):boolean{const l=createHmac('sha256','aoi').update(a).digest(),r=createHmac('sha256','aoi').update(b).digest();return timingSafeEqual(l,r);}
+export async function enqueueNotificationSafely(enqueue:()=>Promise<unknown>, log:Pick<Logger,'warn'>, context:{account_id:string;message_id:string}):Promise<boolean>{try{await enqueue();return true;}catch(error){log.warn({...context,error:error instanceof Error?error.message:'unknown'},'notification queue enqueue failed');return false;}}
+export function startNotificationReconciliation(outbox: Pick<PostgresMessageNotificationOutbox, 'reconcile'>, log: Pick<Logger, 'info' | 'warn'> = logger, intervalMs = 30_000): () => Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  let running: Promise<void> | undefined;
+  const run = async (): Promise<void> => {
+    if (stopped || running) return;
+    running = outbox.reconcile({ limit: 100, maxAttempts: 5 })
+      .then(ids => { if (ids.length) log.info({ count: ids.length }, 'notification outbox reconciled'); })
+      .catch(error => log.warn({ error: error instanceof Error ? error.message : 'unknown' }, 'notification outbox reconciliation failed'))
+      .finally(() => { running = undefined; if (!stopped) timer = setTimeout(() => { void run(); }, intervalMs); });
+    await running;
+  };
+  void run();
+  return async () => { stopped = true; if (timer) clearTimeout(timer); await running; };
+}
+
 function accountById(config:AppConfig,id:string):AccountConfig|undefined{return config.accounts.find(a=>a.id===id&&a.enabled);}
 function accountsById(config:AppConfig,id:string):AccountConfig|undefined{return config.accounts.find(account=>account.id===id);}
 export async function dispatchNotification(store:NotificationConfigStore,message:NormalizedMessage,account:AccountConfig|undefined,deliveryStore?:Pick<PostgresNotificationDeliveryStore,'record'>):Promise<boolean>{
@@ -100,13 +126,39 @@ function queryFilters(params: URLSearchParams): InboxQuery {
   if(at!==null&&at!=='true'&&at!=='false')throw new Error('Invalid at_me');
   return {account_id:params.get('account_id')??undefined,type:type as InboxQuery['type']??undefined,sender:params.get('sender')??undefined,priority:priority as InboxQuery['priority']??undefined,at_me:at===null?undefined:at==='true',keyword:params.get('keyword')??undefined,since:params.get('since')??undefined,until:params.get('until')??undefined,offset:number('offset',0),limit:number('limit',50), ...(stateFilters[0]?{state:stateFilters[0]}:{}) };
 }
-export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string } = {}): Promise<Runtime> {
+function parseAttachmentMaxBytes(raw: string | undefined): number {
+  if (raw === undefined || raw === '') return 10 * 1024 * 1024;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || value > 100 * 1024 * 1024) throw new Error('ATTACHMENT_MAX_BYTES must be an integer from 1 to 104857600');
+  return value;
+}
+function attachmentActionUrlHostAllowed(account: AccountConfig, raw: string | undefined): boolean {
+  if (!account.action_url) return true;
+  let hostname: string;
+  try { hostname = new URL(account.action_url).hostname.toLowerCase(); } catch { return false; }
+  const allowed = new Set((raw ?? '').split(',').map(host => host.trim().toLowerCase()).filter(Boolean));
+  return allowed.has(hostname);
+}
+function validateAttachmentActionUrlHosts(accounts: readonly AccountConfig[], raw: string | undefined): void {
+  for (const account of accounts) {
+    if (!attachmentActionUrlHostAllowed(account, raw)) throw new Error(`Account ${account.id} action_url host must be included in ATTACHMENT_ACTION_URL_ALLOWED_HOSTS`);
+  }
+}
+export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string; accountStore?: Pick<AccountStore, 'loadConfiguredAccounts'|'create'>; inboxRules?: readonly InboxRule[]; notificationDigest?: { enabled: boolean; intervalMs?: number; batchSize?: number } } = {}): Promise<Runtime> {
   if(options.requireDatabase&&!options.databaseUrl)throw new Error('DATABASE_URL is required for durable runtime');
+  const attachmentMaxBytes = parseAttachmentMaxBytes(process.env.ATTACHMENT_MAX_BYTES);
+  validateAttachmentActionUrlHosts(config.accounts, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS);
   if(!config.apiToken)throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
   let pool:Pool|undefined;let runtimeStore:MessageStore|PostgresMessageStore=store??new MessageStore();
   let auditStore:AuditStore|undefined;
   if(!store&&options.databaseUrl){
     if(!options.accountEncryptionKey)throw new Error('ACCOUNT_ENCRYPTION_KEY is required for persistent account settings');
+    if(options.accountStore){
+      const managedAccounts=await options.accountStore.loadConfiguredAccounts();
+      const managedIds=new Set(managedAccounts.map(account=>account.id));
+      config.accounts=[...config.accounts.filter(account=>!managedIds.has(account.id)),...managedAccounts];
+      validateAttachmentActionUrlHosts(config.accounts, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS);
+    }
     pool=new Pool({connectionString:options.databaseUrl,max:10,connectionTimeoutMillis:5000});
     try{
       const migrationDir=path.join(path.dirname(fileURLToPath(import.meta.url)),'..','migrations');
@@ -118,10 +170,11 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
           if(!found.rowCount){await pool.query('BEGIN');try{await pool.query(await readFile(path.join(migrationDir,file),'utf8'));await pool.query('INSERT INTO schema_migrations(name) VALUES($1)',[file]);await pool.query('COMMIT');}catch(error){await pool.query('ROLLBACK');throw error;}}
         }
       }finally{await pool.query('SELECT pg_advisory_unlock($1)',[741029441]);}
-      const postgresAccountStore=new PostgresAccountStore(pool,options.accountEncryptionKey);
+      const postgresAccountStore=options.accountStore??new PostgresAccountStore(pool,options.accountEncryptionKey);
       const managedAccounts=await postgresAccountStore.loadConfiguredAccounts();
       const managedIds=new Set(managedAccounts.map(account=>account.id));
       config.accounts=[...config.accounts.filter(account=>!managedIds.has(account.id)),...managedAccounts];
+      validateAttachmentActionUrlHosts(config.accounts, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS);
       for(const account of config.accounts)if(!managedIds.has(account.id))await postgresAccountStore.create(account);
       runtimeStore=PostgresMessageStore.fromPool(pool);
       auditStore=new PostgresAuditStore(pool);
@@ -134,17 +187,58 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   const accountStore: AccountStore = pool ? new PostgresAccountStore(pool,options.accountEncryptionKey??'') : new MemoryAccountStore();
   const notificationStore: NotificationConfigStore = pool ? new PostgresNotificationConfigStore(pool,options.accountEncryptionKey??'') : new MemoryNotificationConfigStore();
   let activePriorityConfig = pool ? await priorityStore.list() : structuredClone(priorityConfig);
+  const inboxRulesStore: InboxRulesStore = pool ? new PostgresInboxRulesStore(pool) : new MemoryInboxRulesStore();
+  let activeInboxRules: InboxRule[] = pool ? await inboxRulesStore.get() : structuredClone([...(options.inboxRules ?? [])]);
+  const applyRulesToStoredMessage = async (message: NormalizedMessage): Promise<void> => {
+    await applyInboxRules(message, activeInboxRules, store);
+  };
   if(!pool)for(const account of config.accounts)await accountStore.create(account);
   if (!config.apiToken) throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
   if (config.accounts.some(a => a.enabled && !a.access_token)) throw new Error('Every enabled account requires access_token');
 const peers = new Map<string, Peer>();
-  const onebot = new RuntimeOneBotService(peers, store, 15000, pool ? new PostgresOutboundIdempotencyStore(pool) : undefined);
+  const onebot = new RuntimeOneBotService(peers, store, 15000, pool ? new PostgresOutboundIdempotencyStore(pool) : undefined, { ...(config.providerEventToken !== undefined ? { expectedToken: config.providerEventToken } : {}) });
   const contactSearch:ContactsStore=pool?new PostgresContactsStore(pool):new MemoryContactsStore();
   const contactsCache=new ContactsCache();
   const contactsStore:ContactsStore=contactSearch;
   const contactSync=new ContactSyncService(onebot,contactsCache,contactsStore,options.accountEncryptionKey??config.apiToken);
-  const attachmentHandler=createAttachmentRouteHandler({apiToken:config.apiToken,allowedRoots:(process.env.ATTACHMENT_ALLOWED_ROOTS??'').split(path.delimiter).filter(Boolean),maxBytes:Number(process.env.ATTACHMENT_MAX_BYTES??10*1024*1024),resolveAccount:accountId=>{const account=accountById(config,accountId);return account?{permission:account.permission,retrieve:createOneBotFileRetriever(onebot,account)}:undefined;}});
-  const notificationWorker=notificationQueue?new NotificationWorker(notificationQueue,async item=>{
+  const pendingContactRefreshes = new Map<string, Promise<void>>();
+  const scheduleContactRefresh = (account: AccountConfig, event: OneBotEvent): void => {
+    for (const request of mapContactChangeEvent(event)) {
+      const key = `${account.id}:${request.kind}:${request.kind === 'members' ? request.group_id : ''}`;
+      if (pendingContactRefreshes.has(key)) continue;
+      const refresh = Promise.resolve().then(async () => {
+        if (request.kind === 'friends') await contactSync.syncFriends(account);
+        else if (request.kind === 'groups') await contactSync.syncGroups(account);
+        else await contactSync.syncMembers(account, request.group_id);
+      }).catch(error => logger.warn({ account_id: account.id, kind: request.kind, error: error instanceof Error ? error.message : 'unknown' }, 'contact refresh after notice failed')).finally(() => {
+        if (pendingContactRefreshes.get(key) === refresh) pendingContactRefreshes.delete(key);
+      });
+      pendingContactRefreshes.set(key, refresh);
+      // Refresh work is coalesced per account/list and never awaited by ingress.
+      void refresh;
+    }
+  };
+  const attachmentHandler=createAttachmentRouteHandler({apiToken:config.apiToken,allowedRoots:(process.env.ATTACHMENT_ALLOWED_ROOTS??'').split(path.delimiter).filter(Boolean),maxBytes:attachmentMaxBytes,resolveAccount:accountId=>{const account=accountById(config,accountId);return account&&attachmentActionUrlHostAllowed(account,process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS)?{permission:account.permission,retrieve:createOneBotFileRetriever(onebot,account)}:undefined;}});
+  const digestConfig=options.notificationDigest;
+  if(digestConfig?.enabled&&(!pool||!notificationQueue))throw new Error('Notification digest requires durable database configuration');
+  const digestIntervalMs=digestConfig?.intervalMs??30_000;
+  const digestBatchSize=digestConfig?.batchSize??20;
+  if(!Number.isInteger(digestIntervalMs)||digestIntervalMs<1_000||digestIntervalMs>300_000)throw new Error('notificationDigest.intervalMs must be an integer from 1000 to 300000');
+  if(!Number.isInteger(digestBatchSize)||digestBatchSize<1||digestBatchSize>100)throw new Error('notificationDigest.batchSize must be an integer from 1 to 100');
+  const notificationDigestWorker=digestConfig?.enabled&&notificationQueue?new NotificationDigestWorker(notificationQueue,async digest=>{
+    if(!digest.accountId||digest.messageIds.length!==digest.count)return false;
+    const account=accountsById(config,digest.accountId);
+    if(!account)return false;
+    const settings=await notificationStore.get();
+    if(!settings.enabled||!settings.webhookUrl||!settings.webhookSecret)return true;
+    const eligible=[];
+    for(const id of digest.messageIds){const message=await store.get(id);if(!message||message.account_id!==digest.accountId)return false;const levels=['P0','P1','P2','P3','P4'];if(levels.indexOf(message.priority)<=levels.indexOf(settings.minPriority))eligible.push(message);}
+    if(!eligible.length)return true;
+    const notifier=new HermesWebhookNotifier({url:settings.webhookUrl,secret:settings.webhookSecret,timeoutMs:settings.timeoutMs});
+    const event:AgentNotification={event:'message.digest',account:account.alias,message_id:null,priority:eligible.reduce((best,message)=>['P0','P1','P2','P3','P4'].indexOf(message.priority)<['P0','P1','P2','P3','P4'].indexOf(best)?message.priority:best,eligible[0]!.priority),sender:'',conversation:'',preview:'',reason:`${eligible.length} new messages`};
+    try{for(let attempt=0;attempt<settings.maxAttempts;attempt++){try{await notifier.notify(event);return true;}catch{}}return false;}finally{if(notificationDeliveryStore)for(const message of eligible)try{await notificationDeliveryStore.record({event:'message.digest',accountId:account.id,messageId:message.id,outcome:'success',httpStatus:200});}catch{}}
+  },digestBatchSize):undefined;
+  const notificationWorker=!digestConfig?.enabled&&notificationQueue?new NotificationWorker(notificationQueue,async item=>{
     if(!item.accountId||!item.messageId)return false;
     const [message]=await Promise.all([store.get(item.messageId)]);
     const account=accountsById(config,item.accountId);
@@ -152,6 +246,12 @@ const peers = new Map<string, Peer>();
     return await dispatchNotification(notificationStore,message,account,notificationDeliveryStore);
   }):undefined;
   notificationWorker?.start();
+  let digestTimer:ReturnType<typeof setInterval>|undefined;
+  let digestRunning:Promise<void>|undefined;
+  const stopNotificationDigest=async()=>{if(digestTimer)clearInterval(digestTimer);if(digestRunning)await digestRunning;};
+  if(notificationDigestWorker){const run=()=>{if(!digestRunning)digestRunning=notificationDigestWorker.flush(100).then(()=>{}).catch(error=>logger.warn({error:error instanceof Error?error.message:'unknown'},'notification digest flush failed')).finally(()=>{digestRunning=undefined;});};run();digestTimer=setInterval(run,digestIntervalMs);digestTimer.unref();}
+  const notificationOutbox = pool ? new PostgresMessageNotificationOutbox(pool) : undefined;
+  const stopNotificationReconciliation = notificationOutbox ? startNotificationReconciliation(notificationOutbox) : async () => {};
   let eventCount = 0; let duplicateCount = 0; let sendSuccess = 0; let sendFailure = 0;
   const server = createServer();
   const appHandler = async (req: IncomingMessage, res: ServerResponse) => {
@@ -175,12 +275,15 @@ const peers = new Map<string, Peer>();
         const account = accountById(config, decodeURIComponent(eventsMatch[1]!));
         if (!account) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown or disabled account', retryable: false } });
         if (!account.access_token || !safeTokenEqual(account.access_token, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Invalid transport token', retryable: false } });
+        const providerToken = req.headers['x-onebot-token'] ?? req.headers['x-self-id'];
+        if (!onebot.verifyEventToken(Array.isArray(providerToken) ? providerToken[0] : providerToken)) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Invalid provider event token', retryable: false } });
         const event = await readBody(req, config.maxMessageBytes) as OneBotEvent;
+        scheduleContactRefresh(account, event);
         const normalized = normalizeEvent(account.id, account.provider, `http:${account.id}`, event);
         const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
         if (!message) return respond(res, 200, { status: 'ignored' });
-            const result=await store.insert(message); eventCount++; if(!result.inserted)duplicateCount++;else if(auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
-            if(pool)await notificationQueue!.enqueue({event:'message.received',accountId:account.id,messageId:result.message.id,dedupeKey:`message.received:${account.id}:${result.message.id}`});
+            const result=await store.insert(message); if(result.inserted)await applyRulesToStoredMessage(result.message); eventCount++; if(!result.inserted)duplicateCount++;else if(auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
+            if(pool)await enqueueNotificationSafely(()=>notificationQueue!.enqueue({event:'message.received',accountId:account.id,messageId:result.message.id,dedupeKey:`message.received:${account.id}:${result.message.id}`}),logger,{account_id:account.id,message_id:result.message.id});
         return respond(res, 200, { status: result.inserted ? 'stored' : 'duplicate', message_id: result.message.id });
       }
       if (req.method === 'GET' && url.pathname === '/api/accounts') {
@@ -212,6 +315,7 @@ const peers = new Map<string, Peer>();
             const old=config.accounts.find(a=>a.id===accountId);const secret=typeof value.access_token==='string'&&value.access_token?value.access_token:old?.access_token;
             if(value.enabled!==false&&!secret)throw new Error('An enabled account requires access_token');
             const account:AccountConfig={id:accountId,alias:(value.alias as string).trim(),self_id:(value.self_id as string).trim(),provider,enabled:value.enabled!==false,permission:permission as AccountConfig['permission'],...(secret?{access_token:secret}:{}),...(typeof value.action_url==='string'&&value.action_url?{action_url:value.action_url}:{})};
+            if(!attachmentActionUrlHostAllowed(account,process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS))throw new Error(`Account ${account.id} action_url host must be included in ATTACHMENT_ACTION_URL_ALLOWED_HOSTS`);
             const auditChange={actor:'admin',action:id?'account.update':'account.create',account_id:accountId,target_type:'account',target_id:accountId,result:'success' as const,metadata:{provider:account.provider,enabled:account.enabled,permission:account.permission}};
             try{if(id){const updated=await accountStore.update(id,account);if(!updated){if(auditStore)await auditStore.record({...auditChange,result:'failure',metadata:{...auditChange.metadata,error:'Account not found'}});return respond(res,404,{error:{code:'NOT_FOUND',message:'Account not found',retryable:false}});}}
             else {await accountStore.create(account);}
@@ -249,11 +353,59 @@ const peers = new Map<string, Peer>();
           if(req.method==='DELETE'&&watchPath[1]){let id:string;try{id=decodeURIComponent(watchPath[1]);}catch{return respond(res,400,{error:{code:'VALIDATION_ERROR',message:'Invalid watch person id',retryable:false}});}let removed=false;try{removed=await priorityStore.deleteWatchPerson(id);if(removed)activePriorityConfig=await priorityStore.list();}catch(error){if(auditStore)await auditStore.record({actor:'admin',action:'watch_person.delete',target_type:'watch_person',target_id:id,result:'failure',metadata:{error:error instanceof Error?error.message:'Delete failed'}});return respond(res,500,{error:{code:'PERSISTENCE_ERROR',message:'Could not persist watch-person deletion',retryable:true}});}if(auditStore)await auditStore.record({actor:'admin',action:'watch_person.delete',target_type:'watch_person',target_id:id,result:removed?'success':'failure'});if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Watch person not found',retryable:false}});return respond(res,200,{deleted:true});}
         }
 
+      const failedNotificationPath=url.pathname.match(/^\/api\/admin\/notifications\/failed\/([^/]+)\/retry$/);
+      if(req.method==='POST'&&failedNotificationPath){
+        if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+        if(!notificationQueue)return respond(res,503,{error:{code:'QUEUE_UNAVAILABLE',message:'Durable notification queue requires database configuration',retryable:false}});
+        let id:string;try{id=decodeURIComponent(failedNotificationPath[1]!);}catch{return respond(res,400,{error:{code:'VALIDATION_ERROR',message:'Invalid notification id',retryable:false}});}
+        try{const retried=await notificationQueue.retryFailed(id);if(auditStore)await auditStore.record({actor:'admin',action:'notification.retry',target_type:'notification',target_id:id,result:retried?'success':'failure'});return retried?respond(res,200,{retried:true,warning:'Delivery is at-least-once; the previous attempt may have reached the receiver. Verify receiver state before retrying.'}):respond(res,404,{error:{code:'NOT_FOUND',message:'Failed notification not found',retryable:false}});}catch{return respond(res,500,{error:{code:'PERSISTENCE_ERROR',message:'Could not retry notification',retryable:true}});}
+      }
+      if(req.method==='GET'&&url.pathname==='/api/admin/notifications/failed'){
+        if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+        const raw=url.searchParams.get('limit');const limit=raw===null?50:Number(raw);if(!Number.isInteger(limit)||limit<1||limit>100)return respond(res,400,{error:{code:'VALIDATION_ERROR',message:'limit must be an integer from 1 to 100',retryable:false}});
+        if(!notificationQueue)return respond(res,503,{error:{code:'QUEUE_UNAVAILABLE',message:'Durable notification queue requires database configuration',retryable:false}});
+        try{return respond(res,200,{notifications:(await notificationQueue.listFailed(limit)).map(({id,event,accountId,messageId,status,attempts,maxAttempts,runAfter,lastError})=>({id,event,accountId,messageId,status,attempts,maxAttempts,runAfter,lastError}))});}catch{return respond(res,500,{error:{code:'PERSISTENCE_ERROR',message:'Could not read failed notifications',retryable:true}});}
+      }
       if(req.method==='GET'&&url.pathname==='/api/admin/notification-deliveries'){
         if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
         if(!notificationDeliveryStore)return respond(res,503,{error:{code:'HISTORY_UNAVAILABLE',message:'Delivery history requires database configuration',retryable:false}});
         const raw=url.searchParams.get('limit');const limit=raw===null?50:Number(raw);if(!Number.isInteger(limit)||limit<1||limit>100)return respond(res,400,{error:{code:'VALIDATION_ERROR',message:'limit must be an integer from 1 to 100',retryable:false}});
         try{return respond(res,200,{deliveries:await notificationDeliveryStore.list(limit)});}catch{return respond(res,500,{error:{code:'PERSISTENCE_ERROR',message:'Could not read notification delivery history',retryable:true}});}
+      }
+      if (url.pathname === '/api/admin/inbox-rules' && (req.method === 'GET' || req.method === 'PUT')) {
+        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (req.method === 'GET') return respond(res, 200, { rules: await inboxRulesStore.get() });
+        try {
+          const body = await readBody(req, config.maxMessageBytes);
+          if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray((body as Record<string, unknown>).rules)) throw new Error('Body must contain a rules array');
+          const rules = (body as { rules: unknown[] }).rules;
+          if (rules.length > 100) throw new Error('At most 100 rules are allowed');
+          const normalized: InboxRule[] = rules.map((raw, index) => {
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`Rule ${index} must be an object`);
+            const r = raw as Record<string, unknown>;
+            if (typeof r.id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(r.id)) throw new Error(`Rule ${index} has invalid id`);
+            if (!['mark_processed', 'dismiss', 'require_reply', 'urgent'].includes(String(r.action))) throw new Error(`Rule ${r.id} has invalid action`);
+            if (r.enabled !== undefined && typeof r.enabled !== 'boolean') throw new Error(`Rule ${r.id} has invalid enabled`);
+            const list = (key: string, maxLength = 128): string[] | undefined => {
+              const value = r[key]; if (value === undefined) return undefined;
+              if (!Array.isArray(value) || value.length > 100 || value.some(v => typeof v !== 'string' || v.length < 1 || v.length > maxLength)) throw new Error(`Rule ${r.id} has invalid ${key}`);
+              return value as string[];
+            };
+            const conversationTypes = r.conversationTypes;
+            if (conversationTypes !== undefined && (!Array.isArray(conversationTypes) || conversationTypes.length > 2 || conversationTypes.some(v => v !== 'private' && v !== 'group'))) throw new Error(`Rule ${r.id} has invalid conversationTypes`);
+            if (r.atMe !== undefined && typeof r.atMe !== 'boolean') throw new Error(`Rule ${r.id} has invalid atMe`);
+            const accountIds = list('accountIds');
+            const senderIds = list('senderIds');
+            const groupIds = list('groupIds');
+            const keywords = list('keywords', 256);
+            return { id: r.id, action: r.action as InboxRule['action'], ...(r.enabled === undefined ? {} : { enabled: r.enabled as boolean }), ...(accountIds === undefined ? {} : { accountIds }), ...(conversationTypes === undefined ? {} : { conversationTypes: conversationTypes as Array<'private'|'group'> }), ...(senderIds === undefined ? {} : { senderIds }), ...(groupIds === undefined ? {} : { groupIds }), ...(keywords === undefined ? {} : { keywords }), ...(r.atMe === undefined ? {} : { atMe: r.atMe as boolean }) };
+          });
+          if (new Set(normalized.map(rule => rule.id)).size !== normalized.length) throw new Error('Rule ids must be unique');
+          for (const rule of normalized) for (const id of rule.accountIds ?? []) if (!config.accounts.some(account => account.id === id)) throw new Error(`Unknown account scope: ${id}`);
+          await inboxRulesStore.put(normalized);
+          activeInboxRules = structuredClone(normalized);
+          return respond(res, 200, { rules: normalized });
+        } catch (error) { return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: error instanceof Error ? error.message : 'Invalid inbox rules', retryable: false } }); }
       }
       if (req.method === 'GET' && url.pathname === '/api/admin/notifications') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});const value=await notificationStore.get();return respond(res,200,{settings:{...value,webhookSecret:undefined,webhookSecretConfigured:Boolean(value.webhookSecret)}}); }
       if (req.method === 'PUT' && url.pathname === '/api/admin/notifications') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be object');const input=body as Record<string,unknown>,previous=await notificationStore.get();const enabled=input.enabled===undefined?previous.enabled:input.enabled;const webhookUrl=input.webhookUrl===undefined?previous.webhookUrl:input.webhookUrl;const webhookSecret=input.webhookSecret===undefined?'':input.webhookSecret;const minPriority=input.minPriority??previous.minPriority;const includePreview=input.includePreview===undefined?previous.includePreview:input.includePreview;const timeoutMs=input.timeoutMs??previous.timeoutMs,maxAttempts=input.maxAttempts??previous.maxAttempts;if(typeof enabled!=='boolean'||typeof webhookUrl!=='string'||webhookUrl.length>2048||typeof webhookSecret!=='string'||webhookSecret.length>4096||typeof includePreview!=='boolean'||!['P0','P1','P2','P3','P4'].includes(String(minPriority))||typeof timeoutMs!=='number'||!Number.isInteger(timeoutMs)||timeoutMs<500||timeoutMs>60000||typeof maxAttempts!=='number'||!Number.isInteger(maxAttempts)||maxAttempts<1||maxAttempts>10)throw new Error('Invalid notification settings');if(webhookUrl&&new URL(webhookUrl).protocol!=='https:')throw new Error('Webhook URL must use HTTPS');await notificationStore.put({enabled,webhookUrl,webhookSecret:webhookSecret||previous.webhookSecret,minPriority:minPriority as 'P0'|'P1'|'P2'|'P3'|'P4',includePreview,timeoutMs,maxAttempts});if(auditStore)await auditStore.record({actor:'admin',action:'notification.settings.update',target_type:'notification',target_id:'webhook',result:'success',metadata:{enabled,minPriority,includePreview,timeoutMs,maxAttempts,secretConfigured:Boolean(webhookSecret||previous.webhookSecret)}});const saved=await notificationStore.get();return respond(res,200,{settings:{...saved,webhookSecret:undefined,webhookSecretConfigured:Boolean(saved.webhookSecret)}});}catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid settings',retryable:false}});} }
@@ -289,7 +441,19 @@ const peers = new Map<string, Peer>();
           return respond(res, 400, { error: { code: error instanceof Error && 'code' in error ? String((error as Error & { code: string }).code) : 'CONTACT_SYNC_FAILED', message: error instanceof Error ? error.message : 'Contact sync failed', retryable: false } });
         }
       }
-      if(req.method==='GET'&&url.pathname==='/api/admin/accounts'){if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});return respond(res,200,{accounts:config.accounts.map(({access_token:_secret,...a})=>({...a,access_token_configured:Boolean(_secret)}))});}
+      if (req.method === 'GET' && url.pathname === '/api/admin/provider-capabilities') {
+        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        const providers = [...new Set(config.accounts.map(account => account.provider.trim().toLowerCase()))].sort();
+        const capabilities = providers.map(provider => {
+          const registered = getProviderCapabilities(provider);
+          return { provider, declared: registered.actions.size > 0, verified: false, actions: [...registered.actions].sort() };
+        });
+        return respond(res, 200, { verification: 'declarations_only', capabilities });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/admin/accounts') {
+        if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+        return respond(res,200,{accounts:config.accounts.map(({access_token:_secret,...a})=>({...a,access_token_configured:Boolean(_secret)}))});
+      }
       if (req.method === 'GET' && url.pathname === '/api/admin/audit') {
         if (!safeTokenEqual(config.apiToken,bearer(req))) return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
         const limit=Number(url.searchParams.get('limit')??50),offset=Number(url.searchParams.get('offset')??0);
@@ -297,6 +461,16 @@ const peers = new Map<string, Peer>();
         if(!pool)return respond(res,503,{error:{code:'AUDIT_UNAVAILABLE',message:'Persistent audit is unavailable in memory mode',retryable:false}});
         const result=await pool.query('SELECT id,actor,action,account_id,conversation_id,message_id,target_type,target_id,result,metadata,created_at FROM audit_logs ORDER BY created_at DESC,id DESC LIMIT $1 OFFSET $2',[limit,offset]);
         return respond(res,200,{events:result.rows,limit,offset,has_more:result.rows.length===limit});
+      }
+      if (req.method === 'GET' && url.pathname === '/api/admin/history-reconciliation-audit') {
+        if (!safeTokenEqual(config.apiToken,bearer(req))) return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+        if (!pool) return respond(res,503,{error:{code:'AUDIT_UNAVAILABLE',message:'Local consistency audit requires a database',retryable:false}});
+        try {
+          const report=await new PostgresHistoryReconciliationAudit(pool).report();
+          return respond(res,200,report);
+        } catch {
+          return respond(res,503,{error:{code:'AUDIT_UNAVAILABLE',message:'Local consistency audit could not read the database',retryable:true}});
+        }
       }
       if (req.method === 'GET' && url.pathname === '/api/summary') {
         if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
@@ -353,8 +527,19 @@ const peers = new Map<string, Peer>();
         if (!account) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Explicit enabled account is required', retryable: false } });
         if (account.permission !== 'direct') { if(auditStore)await auditStore.record({actor:'admin',action:'message.send',account_id:account.id,target_type:String(body.message_type??''),target_id:typeof body.target_id==='string'?body.target_id:null,result:'failure',metadata:{code:'PERMISSION_DENIED'}});return respond(res, 403, { error: { code: 'PERMISSION_DENIED', message: `Account permission is ${account.permission}`, retryable: false } }); }
         const clientRequestId = typeof body.client_request_id === 'string' ? body.client_request_id : '';
-        const target = String(body.target_id ?? ''); const type = body.message_type;
-        if (!clientRequestId || !target || (type !== 'private' && type !== 'group') || (typeof body.message !== 'string' && !Array.isArray(body.message))) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Explicit client_request_id, target_id, message_type and message are required', retryable: false } });
+        const type = body.message_type;
+        const requestedTarget = typeof body.target_id === 'string' ? body.target_id : '';
+        if (!clientRequestId || (type !== 'private' && type !== 'group') || (typeof body.message !== 'string' && !Array.isArray(body.message)) || body.recipient !== undefined && typeof body.recipient !== 'string') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Explicit client_request_id, target_id or recipient, message_type and message are required', retryable: false } });
+        let target = requestedTarget;
+        if (typeof body.recipient === 'string') {
+          if (type !== 'private') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Contact recipients are supported only for private messages', retryable: false } });
+          const resolution = await contactsStore.search(account.id, body.recipient, 100);
+          if (resolution.status === 'ambiguous') return respond(res, 409, { error: { code: 'AMBIGUOUS_RECIPIENT', message: 'Recipient matches multiple contacts; use an exact QQ ID', retryable: false } });
+          if (resolution.status !== 'resolved') return respond(res, 404, { error: { code: 'RECIPIENT_NOT_FOUND', message: 'Recipient was not found in this account contact list', retryable: false } });
+          if (requestedTarget && requestedTarget !== resolution.contact.qq_id) return respond(res, 400, { error: { code: 'RECIPIENT_TARGET_MISMATCH', message: 'target_id does not match resolved recipient', retryable: false } });
+          target = resolution.contact.qq_id;
+        }
+        if (!target) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Explicit target_id or recipient is required', retryable: false } });
         try {
           if (pool) {
             const outgoing = await onebot.sendMessage(account, type, target, body.message as string | import('./normalize.js').Segment[], clientRequestId);
@@ -378,7 +563,7 @@ const peers = new Map<string, Peer>();
     }
   };
   const wss = new WebSocketServer({ noServer: true, maxPayload: config.maxMessageBytes });
-  const mcp = createMcpService(config, store, contactsStore);
+  const mcp = createMcpService(config, store, contactsStore, { allowedRoots: (process.env.ATTACHMENT_ALLOWED_ROOTS??'').split(path.delimiter).filter(Boolean), maxBytes: attachmentMaxBytes, resolveAccount: accountId => { const account = accountById(config, accountId); return account && attachmentActionUrlHostAllowed(account, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS) ? { permission: account.permission, retrieve: createOneBotFileRetriever(onebot, account) } : undefined; } });
   server.removeAllListeners('request');
   server.on('request', (req, res) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -409,6 +594,7 @@ const peers = new Map<string, Peer>();
     const old = peers.get(account.id); if (old) old.socket.close(4001, 'Replaced by new connection');
     const peer: Peer = { account, socket, connectedAt: Date.now(), pending: new Map() }; peers.set(account.id, peer);
     logger.info({ account_id: account.id, self_id: account.self_id }, 'OneBot transport connected');
+    const liveness = createProviderSessionLiveness({ socket, schedule(callback, delayMs) { const timer = setTimeout(callback, delayMs); timer.unref(); return () => clearTimeout(timer); }, intervalMs: 30_000, timeoutMs: 10_000, onTimeout: () => logger.warn({ account_id: account.id }, 'OneBot transport heartbeat timed out') });
     socket.on('message', async (raw: import('ws').RawData) => {
       let packet: unknown;
       try { packet = JSON.parse(raw.toString()); } catch { logger.warn({ account_id: account.id }, 'invalid OneBot JSON'); return; }
@@ -422,19 +608,21 @@ const peers = new Map<string, Peer>();
       }
       const event = packet as OneBotEvent;
       if (String(event.self_id ?? account.self_id) !== account.self_id) { logger.warn({ account_id: account.id }, 'discarded mismatched self_id event'); return; }
+      scheduleContactRefresh(account, event);
       const normalized = normalizeEvent(account.id, account.provider, `reverse-ws:${account.id}`, event);
       const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
       if (!message) return;
       const result = await store.insert(message); eventCount++; if (!result.inserted) duplicateCount++;
+      if (result.inserted) await applyRulesToStoredMessage(result.message);
       if(result.inserted&&auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
-      if(pool)await notificationQueue!.enqueue({event:'message.received',accountId:account.id,messageId:result.message.id,dedupeKey:`message.received:${account.id}:${result.message.id}`});
+      if(pool)await enqueueNotificationSafely(()=>notificationQueue!.enqueue({event:'message.received',accountId:account.id,messageId:result.message.id,dedupeKey:`message.received:${account.id}:${result.message.id}`}),logger,{account_id:account.id,message_id:result.message.id});
     });
-    socket.on('close', () => { if (peers.get(account.id) === peer) peers.delete(account.id); for (const [key, resolve] of peer.pending) { peer.pending.delete(key); resolve({ error: 'disconnected' }); } logger.warn({ account_id: account.id }, 'OneBot transport disconnected'); });
+    socket.on('close', () => { liveness.stop(); if (peers.get(account.id) === peer) peers.delete(account.id); for (const [key, resolve] of peer.pending) { peer.pending.delete(key); resolve({ error: 'disconnected' }); } logger.warn({ account_id: account.id }, 'OneBot transport disconnected'); });
     socket.on('error', (err: Error) => logger.warn({ account_id: account.id, error: err.message }, 'OneBot socket error'));
   });
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(config.port, config.host, resolve); });
   logger.info({ host: config.host, port: config.port, accounts: config.accounts.length }, 'Agent OneBot Inbox API started');
-  return { store, peers, accounts: config.accounts,address:()=>{const value=server.address();return value&&typeof value==='object'?value:null}, close: async () => { await notificationWorker?.stop(); for (const peer of peers.values()) peer.socket.close(); wss.close(); await new Promise<void>(resolve => server.close(() => resolve())); if (pool) await pool.end(); } };
+  return { store, peers, accounts: config.accounts,address:()=>{const value=server.address();return value&&typeof value==='object'?value:null}, close: async () => { await stopNotificationReconciliation(); await stopNotificationDigest(); await notificationWorker?.stop(); for (const peer of peers.values()) peer.socket.close(); wss.close(); await new Promise<void>(resolve => server.close(() => resolve())); if (pool) await pool.end(); } };
 }
 
 function makeOutgoing(account: AccountConfig, requestId: string, externalId: string, type: 'private' | 'group', target: string, content: unknown): NormalizedMessage {
@@ -443,12 +631,13 @@ function makeOutgoing(account: AccountConfig, requestId: string, externalId: str
   const now = new Date().toISOString();
   return { id: randomUUID(), account_id: account.id, provider_id: account.provider, transport_id: `outgoing:${account.id}`, direction: 'outgoing', external_message_id: externalId || null, client_request_id: requestId, event_fingerprint: '', conversation_id: `${account.id}:${type}:${target}`, conversation_type: type, group_id: type === 'group' ? target : null, peer_user_id: type === 'private' ? target : null, sender_id: account.self_id, sender_name: account.alias, sender_card: null, sent_at: now, received_at: now, plain_text: text, raw_message: content, segments, reply_to_message_id: null, at_users: segments.filter(s => s.type === 'at').map(s => String(s.data.qq ?? '')), at_me: false, at_all: false, priority: 'P2', priority_score: 35, requires_reply: false, urgent: false, deadline: null, raw_event: {} };
 }
+import { safeActionFetch } from './action-url-http.js';
 async function callHttpAction(account: AccountConfig, action: string, params: unknown): Promise<Record<string, unknown>> {
   const base = account.action_url!;
   const url = base.endsWith('/') ? `${base}${action}` : `${base}/${action}`;
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (account.access_token) headers.authorization = `Bearer ${account.access_token}`;
-  const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(params), signal: AbortSignal.timeout(15000) });
+  const response = await safeActionFetch(url, { method: 'POST', headers, body: JSON.stringify(params), signal: AbortSignal.timeout(15000) });
   if (!response.ok) throw new Error(`HTTP OneBot action returned ${response.status}`);
   return await response.json() as Record<string, unknown>;
 }

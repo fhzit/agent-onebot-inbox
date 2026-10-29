@@ -32,6 +32,39 @@ test('authenticated API sends and revokes successfully', async () => {
   } finally { ws.close(); await runtime.close(); }
 });
 
+test('send resolves unique contact by name only within explicit account and refuses ambiguity', async () => {
+  const port = 25210 + Math.floor(Math.random() * 100);
+  const account = { id: 'main', alias: 'Main', self_id: '10001', provider: 'napcat', enabled: true, access_token: 'transport-secret', permission: 'direct' as const };
+  const runtime = await startServer({ host: '127.0.0.1', port, apiToken: 'api-secret', maxMessageBytes: 100000, logMessageContent: false, accounts: [account] });
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/onebot/v11/ws/main`, { headers: { authorization: 'Bearer transport-secret', 'x-self-id': '10001' } });
+  try {
+    await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+    const actions: unknown[] = [];
+    ws.on('message', raw => { const req = JSON.parse(raw.toString()) as { action: string; params: unknown; echo: string }; actions.push(req); ws.send(JSON.stringify({ status: 'ok', retcode: 0, data: { message_id: 778 }, echo: req.echo })); });
+    const headers = { authorization: 'Bearer api-secret', 'content-type': 'application/json' };
+    const syncResult = fetch(`http://127.0.0.1:${port}/api/admin/accounts/main/contacts/sync-friends`, { method: 'POST', headers });
+    const syncAction = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Timed out waiting for friend list')), 3000);
+      const onMessage = (raw: Buffer) => { const req = JSON.parse(raw.toString()) as {action:string;echo:string}; if (req.action !== 'get_friend_list') return; ws.off('message', onMessage); runtime.peers.get('main')!.pending.get(req.echo)!({ status:'ok', retcode:0, data:[{user_id:'111',nickname:'Alice One'},{user_id:'222',nickname:'Alex'},{user_id:'333',nickname:'Alex'}] }); clearTimeout(timer); resolve(); };
+      ws.on('message', onMessage);
+    });
+    await syncAction;
+    assert.equal((await syncResult).status, 200);
+    const base = `http://127.0.0.1:${port}/api/messages/send`;
+    const send = (id: string, target: string, accountId = 'main') => fetch(base, { method: 'POST', headers, body: JSON.stringify({ account_id: accountId, client_request_id: id, recipient: target, message_type: 'private', message: 'hello' }) });
+    const resolved = await send('named-contact', 'Alice One');
+    assert.equal(resolved.status, 200);
+    const sentAction = actions.find(x => (x as {action:string}).action === 'send_private_msg') as {params:{user_id:string}};
+    assert.equal(sentAction.params.user_id, '111');
+    const ambiguous = await send('ambiguous-contact', 'Alex');
+    assert.equal(ambiguous.status, 409);
+    assert.equal((await ambiguous.json() as {error:{code:string}}).error.code, 'AMBIGUOUS_RECIPIENT');
+    assert.equal(actions.filter(x => (x as {action:string}).action === 'send_private_msg').length, 1);
+    const wrongAccount = await send('wrong-account', 'Alice One', 'other');
+    assert.equal(wrongAccount.status, 404);
+  } finally { ws.close(); await runtime.close(); }
+});
+
 test('revoke requires authentication', async () => {
   const port = 24810 + Math.floor(Math.random() * 100);
   const account = { id: 'main', alias: 'Main', self_id: '10001', provider: 'napcat', enabled: true, access_token: 'transport-secret', permission: 'direct' as const };

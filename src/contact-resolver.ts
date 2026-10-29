@@ -15,8 +15,13 @@ export type ContactResolution =
 export function resolveContact(contacts: readonly Contact[], accountId: string | undefined, query: string): ContactResolution {
   const term = query.trim().toLocaleLowerCase();
   if (!term) return { status: 'not_found', contact: null, candidates: [] };
-  const candidates = contacts.filter(contact => (!accountId || contact.account_id === accountId) &&
-    [contact.qq_id, contact.nickname, contact.remark, contact.card].some(value => value?.trim().toLocaleLowerCase() === term));
+  const scopedContacts = contacts.filter(contact => !accountId || contact.account_id === accountId);
+  // Numeric identifiers are authoritative: never resolve an ID by an unrelated
+  // nickname/remark/card that happens to have the same text.
+  const candidates = /^\d+$/.test(term)
+    ? scopedContacts.filter(contact => contact.qq_id.trim() === query.trim())
+    : scopedContacts.filter(contact =>
+      [contact.nickname, contact.remark, contact.card].some(value => value?.trim().toLocaleLowerCase() === term));
   const unique = [...new Map(candidates.map(c => [`${c.account_id}:${c.qq_id}:${c.group_id ?? ''}`, c])).values()];
   if (unique.length === 1) return { status: 'resolved', contact: unique[0]!, candidates: unique };
   if (unique.length > 1) return { status: 'ambiguous', contact: null, candidates: unique };

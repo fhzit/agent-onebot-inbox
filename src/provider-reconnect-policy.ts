@@ -9,7 +9,7 @@ export function reconnectDelayMs(retryIndex: number, options: DelayOptions = def
   const sample = random();
   if (!Number.isFinite(sample) || sample < 0 || sample > 1) throw new RangeError('random sample must be in [0, 1]');
   const capped = Math.min(maxDelayMs, baseDelayMs * 2 ** Math.min(retryIndex, 1023));
-  return Math.round(capped * (1 - jitterRatio + 2 * jitterRatio * sample));
+  return Math.min(maxDelayMs, Math.round(capped * (1 - jitterRatio + 2 * jitterRatio * sample)));
 }
 
 export type ReconnectLifecycleOptions = {

@@ -17,6 +17,7 @@ export type AppConfig = {
   logMessageContent: boolean;
   accounts: AccountConfig[];
   adminBasePath: string;
+  providerEventToken?: string;
 };
 
 function parseBool(value: string | undefined, fallback: boolean): boolean {
@@ -45,6 +46,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     if (ids.has(id)) throw new Error(`Duplicate account id: ${id}`);
     if (selfIds.has(selfId)) throw new Error(`Duplicate self_id: ${selfId}`);
     ids.add(id); selfIds.add(selfId);
+    if (a.action_url !== undefined) {
+      if (typeof a.action_url !== 'string') throw new Error(`Account action_url for ${id} must be a string`);
+      let endpoint: URL;
+      try { endpoint = new URL(a.action_url); } catch { throw new Error(`Invalid action_url for ${id}`); }
+      if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') throw new Error(`Account action_url for ${id} must use http or https`);
+      if (!endpoint.hostname) throw new Error(`Account action_url for ${id} must include a host`);
+      // WHATWG URL normalizes an empty explicit port (e.g. https://host:/) away;
+      // reject that ambiguous spelling before URL construction.
+      if (/^[a-z][a-z\d+.-]*:\/\/[^/?#]*:\/?(?:[/?#]|$)/i.test(a.action_url)) throw new Error(`Invalid port in action_url for ${id}`);
+      if (endpoint.port && (Number(endpoint.port) < 1 || Number(endpoint.port) > 65535)) throw new Error(`Invalid port in action_url for ${id}`);
+      if (endpoint.username || endpoint.password) throw new Error(`Account action_url for ${id} must not contain credentials`);
+      if (endpoint.search) throw new Error(`Account action_url for ${id} must not contain a query`);
+      if (endpoint.hash) throw new Error(`Account action_url for ${id} must not contain a fragment`);
+    }
     const permission = (a.permission ?? env.PERMISSIONS_DEFAULT ?? 'readonly') as string;
     if (!['readonly', 'confirm', 'direct'].includes(permission)) throw new Error(`Invalid permission for ${id}`);
     return {
@@ -62,5 +77,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     logMessageContent: parseBool(env.LOG_MESSAGE_CONTENT, false),
     accounts,
     adminBasePath: (() => { const value = (env.ADMIN_BASE_PATH ?? '/admin').replace(/\/$/, ''); if (!/^\/[a-zA-Z0-9/_-]*$/.test(value) || value === '/') throw new Error('ADMIN_BASE_PATH must be a non-root path'); return value; })(),
+    ...(env.ONEBOT_EVENT_TOKEN !== undefined ? { providerEventToken: env.ONEBOT_EVENT_TOKEN } : {}),
   };
 }

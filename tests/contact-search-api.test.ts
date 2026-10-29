@@ -40,20 +40,23 @@ test('contact search requires admin authentication and scopes results to request
     assert.equal(wrong.status, 401);
 
     const syncFriends = async (ws: WebSocket, accountId: string, rows: unknown[]) => {
-      const request = fetch(`http://127.0.0.1:${port}/api/admin/accounts/${accountId}/contacts/sync-friends`, { method: 'POST', headers: { authorization: `Bearer ${token}` } });
-      await new Promise<void>((resolve, reject) => {
+      const observedAction = new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('Timed out waiting for get_friend_list')), 3000);
-        ws.once('message', data => {
+        const onMessage = (data: Buffer) => {
           try {
             const frame = JSON.parse(data.toString());
-            assert.equal(frame.action, 'get_friend_list');
+            if (frame.action !== 'get_friend_list') return;
+            ws.off('message', onMessage);
             const peer = runtime!.peers.get(accountId)!;
             assert.ok(peer.pending.has(frame.echo));
             peer.pending.get(frame.echo)!({ status: 'ok', retcode: 0, data: rows });
             clearTimeout(timer); resolve();
-          } catch (error) { clearTimeout(timer); reject(error); }
-        });
+          } catch (error) { ws.off('message', onMessage); clearTimeout(timer); reject(error); }
+        };
+        ws.on('message', onMessage);
       });
+      const request = fetch(`http://127.0.0.1:${port}/api/admin/accounts/${accountId}/contacts/sync-friends`, { method: 'POST', headers: { authorization: `Bearer ${token}` } });
+      await observedAction;
       assert.equal((await request).status, 200);
     };
     await syncFriends(sockets[0]!, 'one', [{ user_id: '111', nickname: 'Alice One' }, { user_id: '222', nickname: 'Alex Alice' }]);
@@ -77,20 +80,23 @@ test('contact search validates query length and limit, and reports ambiguous mat
   const ws = new WebSocket(`ws://127.0.0.1:${port}/onebot/v11/ws/one`, { headers: { authorization: 'Bearer one-transport' } });
   try {
     await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
-    const sync = fetch(`http://127.0.0.1:${port}/api/admin/accounts/one/contacts/sync-friends`, { method: 'POST', headers: { authorization: `Bearer ${token}` } });
-    await new Promise<void>((resolve, reject) => {
+    const request = fetch(`http://127.0.0.1:${port}/api/admin/accounts/one/contacts/sync-friends`, { method: 'POST', headers: { authorization: `Bearer ${token}` } });
+    const observedAction = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Timed out waiting for get_friend_list')), 3000);
-      ws.once('message', data => {
+      const onMessage = (data: Buffer) => {
         try {
           const frame = JSON.parse(data.toString());
-          assert.equal(frame.action, 'get_friend_list');
+          if (frame.action !== 'get_friend_list') return;
+          ws.off('message', onMessage);
           const peer = runtime!.peers.get('one')!;
           peer.pending.get(frame.echo)!({ status: 'ok', retcode: 0, data: [{ user_id: '111', nickname: 'Alex' }, { user_id: '222', nickname: 'Alex' }] });
           clearTimeout(timer); resolve();
-        } catch (error) { clearTimeout(timer); reject(error); }
-      });
+        } catch (error) { ws.off('message', onMessage); clearTimeout(timer); reject(error); }
+      };
+      ws.on('message', onMessage);
     });
-    assert.equal((await sync).status, 200);
+    await observedAction;
+    assert.equal((await request).status, 200);
     const base = `http://127.0.0.1:${port}/api/admin/accounts/one/contacts/search`;
     const headers = { authorization: `Bearer ${token}` };
     for (const url of [`${base}?q=${'x'.repeat(201)}`, `${base}?q=Alex&limit=0`, `${base}?q=Alex&limit=101`, `${base}?q=Alex&limit=nope`]) {

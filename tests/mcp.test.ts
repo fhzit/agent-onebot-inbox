@@ -19,6 +19,7 @@ test('MCP registers account and searchable inbox tools with strict inputs', asyn
     const listed = await client.listTools();
     assert.ok(listed.tools.some(tool => tool.name === 'accounts_list'));
     assert.ok(listed.tools.some(tool => tool.name === 'inbox_search'));
+    assert.ok(listed.tools.some(tool => tool.name === 'extract_tasks_from_history'));
     assert.ok(!listed.tools.some(tool => tool.name === 'contacts_list'));
     assert.ok(!listed.tools.some(tool => tool.name === 'contacts_search'));
     const accounts = await client.callTool({ name: 'accounts_list', arguments: {} });

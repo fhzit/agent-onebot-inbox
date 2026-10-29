@@ -1,3 +1,4 @@
+import { safeActionFetch } from './action-url-http.js';
 import { normalizeEvent, type NormalizedMessage, type Segment } from './normalize.js';
 import type { AccountConfig } from './config.js';
 import type { PriorityConfig } from './priority.js';
@@ -33,7 +34,7 @@ export class OneBotService implements OneBotGateway {
       const url = base.endsWith('/') ? `${base}${action}` : `${base}/${action}`;
       const headers: Record<string, string> = { 'content-type': 'application/json' };
       if (account.access_token) headers.authorization = `Bearer ${account.access_token}`;
-      const httpResponse = await fetch(url, { method: 'POST', headers, body: JSON.stringify(params), signal: AbortSignal.timeout(this.timeoutMs) });
+      const httpResponse = await safeActionFetch(url, { method: 'POST', headers, body: JSON.stringify(params), signal: AbortSignal.timeout(this.timeoutMs) });
       if (!httpResponse.ok) throw Object.assign(new Error(`HTTP OneBot action returned ${httpResponse.status}`), { code: 'ACTION_FAILED' });
       response = await httpResponse.json();
       const result = record(response);
@@ -55,7 +56,7 @@ export class OneBotService implements OneBotGateway {
   async callApi(account:AccountConfig,action:string,params:Record<string,unknown>):Promise<unknown>{
     const peer=this.peers.get(account.id);
     if(peer?.socket.readyState===1)return this.call(peer,action,params);
-    if(account.action_url){const url=account.action_url.endsWith('/')?`${account.action_url}${action}`:`${account.action_url}/${action}`;const headers:Record<string,string>={'content-type':'application/json'};if(account.access_token)headers.authorization=`Bearer ${account.access_token}`;const response=await fetch(url,{method:'POST',headers,body:JSON.stringify(params),signal:AbortSignal.timeout(this.timeoutMs)});if(!response.ok)throw Object.assign(new Error(`HTTP OneBot action returned ${response.status}`),{code:'ACTION_FAILED'});const value=await response.json();const result=record(value);if(result.status!=='ok'||Number(result.retcode)!==0)throw Object.assign(new Error('OneBot action rejected'),{code:'ACTION_REJECTED'});return value;}
+    if(account.action_url){const url=account.action_url.endsWith('/')?`${account.action_url}${action}`:`${account.action_url}/${action}`;const headers:Record<string,string>={'content-type':'application/json'};if(account.access_token)headers.authorization=`Bearer ${account.access_token}`;const response=await safeActionFetch(url,{method:'POST',headers,body:JSON.stringify(params),signal:AbortSignal.timeout(this.timeoutMs)});if(!response.ok)throw Object.assign(new Error(`HTTP OneBot action returned ${response.status}`),{code:'ACTION_FAILED'});const value=await response.json();const result=record(value);if(result.status!=='ok'||Number(result.retcode)!==0)throw Object.assign(new Error('OneBot action rejected'),{code:'ACTION_REJECTED'});return value;}
     throw Object.assign(new Error('No active Reverse WebSocket connection or HTTP action_url'),{code:'TRANSPORT_UNAVAILABLE'});
   }
   private call(peer: PeerLike, action: string, params: unknown): Promise<unknown> {

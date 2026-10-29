@@ -35,6 +35,8 @@ export function createManagedReverseWsClient<T extends { close: () => void }>(op
   random?: () => number;
 }) {
   let socket: T | undefined;
+  const connecting = new Set<T>();
+  const disposed = new WeakSet<object>();
   let closed = false;
   let generation = 0;
   const lifecycle = createProviderLifecycle({
@@ -44,23 +46,36 @@ export function createManagedReverseWsClient<T extends { close: () => void }>(op
     connect(events) {
       const attempt = ++generation;
       let candidate: T | undefined;
+      const dispose = () => {
+        if (!candidate) return;
+        if (disposed.has(candidate)) return;
+        disposed.add(candidate);
+        connecting.delete(candidate);
+        if (socket === candidate) socket = undefined;
+        candidate.close();
+      };
       try {
         candidate = options.connect({
           connected() {
             if (!candidate) return;
-            if (closed || attempt !== generation) { candidate.close(); return; }
+            if (closed || attempt !== generation) { dispose(); return; }
+            connecting.delete(candidate);
             const prior = socket;
             socket = candidate;
             events.connected();
             if (prior && prior !== candidate) prior.close();
+            for (const pending of connecting) pending.close();
+            connecting.clear();
           },
           failed() {
-            if (closed || attempt !== generation) return;
-            if (socket === candidate) socket = undefined;
-            candidate?.close();
+            if (closed || attempt !== generation) { dispose(); return; }
+            if (!candidate) return;
+            dispose();
             events.failed();
           },
         });
+        if (closed || attempt !== generation) candidate.close();
+        else connecting.add(candidate);
       } catch {
         events.failed();
         return;
@@ -77,6 +92,8 @@ export function createManagedReverseWsClient<T extends { close: () => void }>(op
       const active = socket;
       socket = undefined;
       active?.close();
+      for (const pending of connecting) pending.close();
+      connecting.clear();
     },
     get currentSocket() { return socket; },
     get isClosed() { return closed; },

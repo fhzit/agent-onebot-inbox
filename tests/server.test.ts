@@ -3,9 +3,39 @@ import { test } from 'node:test';
 import { loadConfig } from '../src/config.js';
 import { startServer } from '../src/server.js';
 import { WebSocket } from 'ws';
+import { enqueueNotificationSafely, startNotificationReconciliation } from '../src/server.js';
 import type { PriorityConfig } from '../src/priority.js';
 
 const account = { id: 'main', alias: 'Main', self_id: '10001', provider: 'napcat', enabled: true, access_token: 'transport-secret', permission: 'direct' as const };
+
+test('notification enqueue failure is logged without rejecting ingress work', async () => {
+  const logs: unknown[] = [];
+  const result = await enqueueNotificationSafely(async () => { throw new Error('queue offline'); }, { warn: (data) => logs.push(data) }, { account_id: 'main', message_id: 'm1' });
+  assert.equal(result, false);
+  assert.equal(logs.length, 1);
+});
+
+test('notification reconciliation is bounded, single-flight, and stops cleanly', async () => {
+  let calls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const outbox = { async reconcile(options: { limit?: number; maxAttempts?: number }) { calls++; assert.deepEqual(options, { limit: 100, maxAttempts: 5 }); await gate; return []; } };
+  const stop = startNotificationReconciliation(outbox, { info() {}, warn() {} }, 5);
+  await new Promise(resolve => setTimeout(resolve, 15));
+  assert.equal(calls, 1);
+  release();
+  await stop();
+  await new Promise(resolve => setTimeout(resolve, 15));
+  assert.equal(calls, 1);
+});
+
+test('notification reconciliation contains errors and remains stoppable', async () => {
+  const warnings: unknown[] = [];
+  const stop = startNotificationReconciliation({ async reconcile() { throw new Error('database unavailable'); } }, { info() {}, warn(data) { warnings.push(data); } }, 5);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  await stop();
+  assert.ok(warnings.length >= 1);
+});
 
 test('HTTP and WebSocket ingress apply injected priority rules', async () => {
   const port = 23000 + Math.floor(Math.random() * 1000);
@@ -21,6 +51,41 @@ test('HTTP and WebSocket ingress apply injected priority rules', async () => {
     await new Promise(resolve => setTimeout(resolve, 50));
     assert.deepEqual(runtime.store.list('main').map(m => [m.priority, m.priority_score]), [['P1', 65], ['P1', 65]]);
     ws.close();
+  } finally { await runtime.close(); }
+});
+
+test('HTTP ingress applies configured inbox state rules without changing QQ read status', async () => {
+  const port = 24000 + Math.floor(Math.random() * 1000);
+  const runtime = await startServer({ host: '127.0.0.1', port, apiToken: 'api-secret', maxMessageBytes: 100000, logMessageContent: false, accounts: [account] }, undefined, undefined, { inboxRules: [{ id: 'auto-process', keywords: ['archive'], action: 'mark_processed' }] });
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/onebot/v11/events/main`, { method: 'POST', headers: { authorization: 'Bearer transport-secret', 'content-type': 'application/json' }, body: JSON.stringify({ post_type: 'message', message_type: 'private', self_id: 10001, user_id: 42, message_id: 22, time: 1700000000, message: 'please archive this' }) });
+    assert.equal(response.status, 200);
+    const stored = runtime.store.list('main')[0]!;
+    assert.deepEqual(runtime.store.state(stored.id), { unread: false, seen_by_agent: true, processed: true, dismissed: false, qq_read: false });
+  } finally { await runtime.close(); }
+});
+
+test('inbox rules API is authenticated, validates, and changes ingress behavior', async () => {
+  const port = 25000 + Math.floor(Math.random() * 1000);
+  const runtime = await startServer({ host: '127.0.0.1', port, apiToken: 'api-secret', maxMessageBytes: 100000, logMessageContent: false, accounts: [account] });
+  const base = `http://127.0.0.1:${port}`;
+  const headers = { authorization: 'Bearer api-secret', 'content-type': 'application/json' };
+  try {
+    assert.equal((await fetch(`${base}/api/admin/inbox-rules`)).status, 401);
+    const initial = await fetch(`${base}/api/admin/inbox-rules`, { headers });
+    assert.deepEqual(await initial.json(), { rules: [] });
+    const invalid = await fetch(`${base}/api/admin/inbox-rules`, { method: 'PUT', headers, body: JSON.stringify({ rules: [{ id: 'bad', action: 'snooze' }] }) });
+    assert.equal(invalid.status, 400);
+    const savedRules = [{ id: 'archive', keywords: ['archive'], action: 'mark_processed' }];
+    const saved = await fetch(`${base}/api/admin/inbox-rules`, { method: 'PUT', headers, body: JSON.stringify({ rules: savedRules }) });
+    assert.equal(saved.status, 200);
+    assert.deepEqual(await saved.json(), { rules: savedRules });
+    const readback = await fetch(`${base}/api/admin/inbox-rules`, { headers });
+    assert.deepEqual(await readback.json(), { rules: savedRules });
+    const ingress = await fetch(`${base}/onebot/v11/events/main`, { method: 'POST', headers: { authorization: 'Bearer transport-secret', 'content-type': 'application/json' }, body: JSON.stringify({ post_type: 'message', message_type: 'private', self_id: 10001, user_id: 42, message_id: 225, time: 1700000000, message: 'please archive this' }) });
+    assert.equal(ingress.status, 200);
+    const stored = runtime.store.list('main')[0]!;
+    assert.equal(runtime.store.state(stored.id).processed, true);
   } finally { await runtime.close(); }
 });
 

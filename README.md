@@ -30,9 +30,9 @@ NapCat / SnowLuma
 - Inbox 查询过滤与分页、上下文查询、Agent 处理/忽略状态。读取和更新 Agent 状态不会触发 QQ 标记已读。
 - MCP TypeScript SDK（stdio 与 Streamable HTTP）、只读 API CLI。
 - PostgreSQL schema、migration runner 和 runtime message/Inbox repository 已接线；当前生产容器已通过数据库连接 readiness。备份恢复及真实 provider 行为仍未验证。
-- Hermes Generic V2 通知能力使用有界同步重试、尽力投递；新增 PostgreSQL 通知队列存储与 migration 尚未接入 runtime，不能视为已启用的持久队列。
+- Hermes Generic V2 通知在 PostgreSQL 模式下通过入站事件进入持久通知队列，由 runtime worker 轮询并投递；队列与 worker 已接线，但 live PostgreSQL migration/queue、重试恢复及真实 webhook/provider E2E 尚未验证。非 PostgreSQL 模式不启用持久队列；投递仍非 exactly-once。
 - PostgreSQL outbound idempotency 已接入发送 runtime（仅 PostgreSQL 模式）；pending/uncertain 请求会阻止自动重试，但不提供 exactly-once 保证。生产/live-provider 行为尚未验收。
-- Provider lifecycle controller 与 OneBot `get_file` 适配、安全本地附件检索 helper 有实现及 fixture 测试；前者未接入生产传输，后者没有 authenticated API route。
+- OneBot `get_file` 附件检索已接入 authenticated `GET /api/attachments/:accountId/:fileId` runtime route，受账号权限、主机 allowlist、根目录 sandbox 和大小限制；上传/send 未实现，真实 provider E2E 未验证。Provider lifecycle controller 仍未接入生产传输。
 
 详见[实现状态与未完成项](docs/status.md)。这不是 NapCat/SnowLuma 完整适配声明；各 provider 的真实兼容性尚未实测。
 
@@ -105,25 +105,26 @@ npm run aoi -- summary --since 2026-10-20T00:00:00Z
 npm run aoi -- search 报名 --account main
 ```
 
-当前 CLI 搜索仅在 API 返回的最多 200 条记录中做本地子串筛选；`unread` 命令当前不能视为可靠的持久未读过滤。不是 PostgreSQL 全文搜索。
+CLI `unread` 会请求 API 的 `unread=true` 过滤；该标记是 Agent inbox 未读状态，不是 QQ 平台已读状态。CLI 搜索会分页读取后本地子串筛选，不是 PostgreSQL 全文搜索。
 
 ## Management console
 
 - In the admin UI, open **设置 → 账号** and choose **添加账号**. Enter a unique internal ID, display name, your QQ `self_id`, provider (`napcat` or `snowluma`), and the OneBot access token. Keep permission at **readonly** until you intentionally enable sending. Enable the account only after its OneBot endpoint is reachable. For NapCat/SnowLuma, configure a Reverse WebSocket client targeting `wss://<your-inbox-host>/onebot/v11/ws/<account-id>` with the same access token; do not expose an unauthenticated OneBot endpoint publicly. Creating an account does not install or log in to QQ for you.
 - If managing outside the UI, use authenticated `POST /api/admin/accounts` with `{id,alias,self_id,provider,access_token,permission,enabled,action_url?}`; omit secrets from logs and shell history. PostgreSQL mode encrypts account tokens with `ACCOUNT_ENCRYPTION_KEY`; admin reads redact secret values.
 - Sensitive admin actions are written to the PostgreSQL audit table when configured; the read-only API is `GET /api/admin/audit`. Memory mode responds with `503 AUDIT_UNAVAILABLE`.
-- Notification settings support a Hermes Generic V2 webhook, priority threshold, optional message preview, timeout/retry bounds, and a test action. Secrets are encrypted with the runtime `ACCOUNT_ENCRYPTION_KEY`; delivery uses bounded synchronous retries and is best-effort (the durable queue/delivery ledger is not wired yet).
+- Notification settings support a Hermes Generic V2 webhook, priority threshold, optional message preview, timeout/retry bounds, and a test action. Secrets are encrypted with the runtime `ACCOUNT_ENCRYPTION_KEY`; PostgreSQL mode uses the runtime-wired durable queue/worker for inbound notifications. Live queue migration/recovery and provider delivery remain unverified.
 - Account token values are write-only and never returned by management APIs; PostgreSQL mode encrypts them with AES-256-GCM using the externally supplied `ACCOUNT_ENCRYPTION_KEY` (base64-encoded 32 bytes). Keep this key in the protected runtime environment and back it up separately; losing it makes stored account tokens unrecoverable. Memory mode is volatile. The admin UI keeps its API token in tab memory only. In-memory settings disappear on process restart.
 - The admin page build parses inline JavaScript with Node during typecheck/build; tests extract the served HTML and verify script syntax.
 
 ## Still missing or unverified
 
 - Full NapCat/SnowLuma onboarding, provider capability compatibility, and automatic transport lifecycle/reconnect.
-- Contact-aware send-route resolution, contact search/edit, and contact change/member-role event sync.
+- Contact/group/member sync and contact search are runtime-wired through authenticated account admin API routes, with memory/PostgreSQL-backed storage and signed pagination cursors; contact-change events and contact-aware send routing remain unimplemented, and live provider behavior is unverified.
+- Authenticated, optional OneBot HTTP event token validation is configurable via `ONEBOT_EVENT_TOKEN`; it is separate from the account transport token and is not enabled unless configured.
 - AI classification, summaries, and task extraction.
-- Runtime-wired durable notification queue/worker, batching/digests, and queue retry lifecycle. Queue store/helper and migration `0011_notification_queue.sql` exist, but are not runtime wired and migration `0011` has not been tested against a live database. The separately wired delivery history is not a queue.
+- Live PostgreSQL validation of the runtime-wired notification queue/worker, retry/restart behavior and delivery outcomes; opt-in bounded per-account digest logic is implemented but live digest delivery is unqualified. No real provider/webhook end-to-end qualification.
 - Audit rows are written to PostgreSQL for sensitive admin actions; API exposure remains read-only. The application role cannot update/delete/truncate audit rows. This does not protect against database-owner tampering, and deployment currently uses a shared application DB role; an independently administered audit sink and retention policy are not implemented.
-- Authenticated attachment retrieval route/upload, backup/restore drill, user-role management, and full MCP tools/remote transport lifecycle. The `get_file` adapter and sandboxed local-file retrieval helper are not exposed through an authenticated route.
+- Attachment upload/send, backup/restore drill, user-role management, and full MCP tools/remote transport lifecycle. Authenticated attachment retrieval route exists but lacks real provider E2E qualification.
 - Real QQ/provider end-to-end, security/load tests, and publicly reachable Cloudflare route validation.
 
 This is still Alpha, not a complete product or production-ready service.
@@ -131,11 +132,11 @@ This is still Alpha, not a complete product or production-ready service.
 
 The GitHub Actions workflow tests pull requests and builds the container image without publishing it. Pushes to `main` publish `ghcr.io/fhzit/agent-onebot-inbox:main`; version-tag pushes (`v*`) publish the corresponding version tag. The workflow also publishes branch/tag and `sha-...` tags for pushed refs. GHCR packages may initially be private: set package visibility to **Public** in the package's GitHub settings after its first successful push if unauthenticated pulls are intended. `GITHUB_TOKEN` can publish only with repository Actions package-write permission and package access; it does not make package visibility public automatically.
 
-The image is an early-development build, not a production deployment promise. Compose's PostgreSQL is not currently used by API runtime for message storage. Review the Docker configuration and use test data before running it.
+The image is an early-development build, not a production deployment promise. When configured with `DATABASE_URL`, PostgreSQL is used by API runtime for message storage and related durable features; production persistence/recovery qualification remains incomplete. Review Docker configuration and use test data before running it.
 
 ## 数据与安全边界
 
-- 消息写入 PostgreSQL 持久化；已用生产容器验证 ready/DB connected，尚未做实际 QQ 入站与读回闭环验证。
+- PostgreSQL 模式下消息写入持久化；已用生产容器验证 ready/DB connected，尚未做实际 QQ 入站与读回闭环或 backup/restore 验证。
 - PostgreSQL migration/runtime wiring is in place and production readiness returned database-connected. A full backup/restore drill, live QQ ingest/readback round trip, and retention/recovery proof remain outstanding.
 - 发送需要 API 鉴权、显式账号和明确目标；账号默认应为 `readonly`。生产环境的授权策略、并发幂等、审计日志和恢复机制尚不完整。
 - 撤回仅允许对当前内存库中已知的本人发出消息操作；撤回记录没有持久审计。
@@ -160,7 +161,7 @@ npm audit --omit=dev
 - 完成 PostgreSQL 持久化的生产验证，并测试迁移、备份与恢复；outbound idempotency 当前已在 PostgreSQL send runtime 接线，但不保证 exactly-once。
 - 建立 provider capability/adapter 层并对 NapCat、SnowLuma 做真实兼容性验证。
 - 补齐 Forward WS、HTTP Action、联系人与历史同步、附件传输和持久化审计。
-- 完善可恢复的队列、通知/Webhook 生命周期、CLI 未读语义与 Web UI。
+- 完善并验证通知队列恢复/重试、通知/Webhook 生命周期与 Web UI；CLI unread filter 已接入。
 - 增加受保护的 CI、镜像构建、部署与端到端验收。
 
 GHCR CI 镜像地址（推送成功后）：`ghcr.io/fhzit/agent-onebot-inbox:main`。

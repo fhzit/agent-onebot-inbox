@@ -6,7 +6,7 @@ test('reconnect delay grows exponentially, caps, and applies injected bounded ji
   const options = { baseDelayMs: 100, maxDelayMs: 500, jitterRatio: 0.2 };
   assert.equal(reconnectDelayMs(0, options, () => 0), 80);
   assert.equal(reconnectDelayMs(1, options, () => 0.5), 200);
-  assert.equal(reconnectDelayMs(20, options, () => 1), 600);
+  assert.equal(reconnectDelayMs(20, options, () => 1), 500);
 });
 
 test('delay rejects invalid retry indexes and jitter samples', () => {

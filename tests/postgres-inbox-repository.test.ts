@@ -19,8 +19,10 @@ test('Postgres inbox query uses parameterized filters and paginates result', asy
   const db: SqlClient = { async query(text, values) { calls.push({ text, values }); return text.includes('COUNT') ? { rows: [{ total: '0' }] } : { rows: [] }; } };
   const result = await new PostgresMessageStore(db).query({ account_id: 'main', type: 'private', sender: '2', priority: 'P1', at_me: true, keyword: 'hi', since: '2024-01-01', until: '2025-01-01', offset: 3, limit: 7 });
   assert.deepEqual(result, { messages: [], total: 0, offset: 3, limit: 7, has_more: false });
+  assert.ok(calls.some(call => call.text.includes("to_tsvector('simple', m.plain_text) @@ plainto_tsquery('simple', $")), 'keyword filtering should use indexed PostgreSQL full-text search');
+  assert.ok(calls.every(call => !call.text.includes('ILIKE')), 'keyword filtering should not fall back to unindexed substring matching');
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls[0]!.values, ['main', 'private', '2', 'P1', true, '%hi%', '2024-01-01', '2025-01-01']);
+  assert.deepEqual(calls[0]!.values, ['main', 'private', '2', 'P1', true, 'hi', '2024-01-01', '2025-01-01']);
 });
 
 test('Postgres conversation context is scoped to the target account and conversation', async () => {

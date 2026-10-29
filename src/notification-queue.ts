@@ -14,6 +14,7 @@ export type NotificationQueueItem = {
   runAfter: Date;
   leaseToken: string | null;
 };
+export type FailedNotification = NotificationQueueItem & { lastError: string | null };
 export type EnqueueNotification = { event: string; accountId?: string | null; messageId?: string | null; dedupeKey: string; maxAttempts?: number; runAfter?: Date };
 export type ClaimedNotification = NotificationQueueItem & { status: 'processing'; leaseToken: string };
 
@@ -38,7 +39,11 @@ export class PostgresNotificationQueue {
     const seconds = Number.isFinite(leaseSeconds) ? Math.max(1, Math.min(3600, Math.floor(leaseSeconds))) : 60;
     const token = this.makeLeaseToken();
     const result = await this.db.query<Row>(
-      `WITH candidate AS (
+      `WITH exhausted AS (
+         UPDATE notification_queue SET status='failed', lease_token=NULL, lease_until=NULL, updated_at=now()
+         WHERE status='processing' AND lease_until <= now() AND attempts >= max_attempts
+         RETURNING id
+       ), candidate AS (
          SELECT id FROM notification_queue
          WHERE attempts < max_attempts AND run_after <= now()
            AND (status = 'pending' OR (status = 'processing' AND lease_until <= now()))
@@ -53,10 +58,40 @@ export class PostgresNotificationQueue {
     return row ? { ...requiredRow(row, 'Invalid claimed notification'), status: 'processing', leaseToken: token } : null;
   }
 
+  async listFailed(limit = 50): Promise<FailedNotification[]> {
+    const boundedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(100, Math.floor(limit))) : 50;
+    const result = await this.db.query<Row & { last_error: string | null }>(
+      `SELECT ${columns}, last_error FROM notification_queue
+       WHERE status = 'failed' ORDER BY updated_at DESC, id LIMIT $1`, [boundedLimit],
+    );
+    return result.rows.map((row) => ({ ...requiredRow(row, 'Invalid failed notification'), lastError: safeError(row.last_error) }));
+  }
+
+  /** Explicitly requeue a terminal failure. Resets the retry budget only after an admin action. */
+  async retryFailed(id: string): Promise<boolean> {
+    const result = await this.db.query<{ id: string }>(
+      `UPDATE notification_queue SET status='pending', attempts=0, run_after=now(), last_error=NULL,
+         lease_token=NULL, lease_until=NULL, updated_at=now()
+       WHERE id=$1 AND status='failed' RETURNING id`, [id],
+    );
+    return result.rows.length === 1;
+  }
+
+  /** Extend an owned, still-live lease; expired leases cannot be resurrected. */
+  async renew(id: string, leaseToken: string, leaseSeconds = 60): Promise<boolean> {
+    const seconds = Number.isFinite(leaseSeconds) ? Math.max(1, Math.min(3600, Math.floor(leaseSeconds))) : 60;
+    const result = await this.db.query<{ id: string }>(
+      `UPDATE notification_queue SET lease_until=now()+($3 * interval '1 second'), updated_at=now()
+       WHERE id=$1 AND status='processing' AND lease_token=$2 AND lease_until > now() RETURNING id`,
+      [id, leaseToken, seconds],
+    );
+    return result.rows.length === 1;
+  }
+
   async complete(id: string, leaseToken: string): Promise<boolean> {
     const result = await this.db.query<{ id: string }>(
       `UPDATE notification_queue SET status='succeeded', lease_token=NULL, lease_until=NULL, last_error=NULL, updated_at=now()
-       WHERE id=$1 AND status='processing' AND lease_token=$2 RETURNING id`, [id, leaseToken],
+       WHERE id=$1 AND status='processing' AND lease_token=$2 AND lease_until > now() RETURNING id`, [id, leaseToken],
     );
     return result.rows.length === 1;
   }
@@ -67,7 +102,7 @@ export class PostgresNotificationQueue {
          run_after=CASE WHEN attempts >= max_attempts THEN now()
            ELSE COALESCE($3, now()+LEAST(interval '1 hour', interval '5 seconds' * power(2, LEAST(attempts-1, 10)))) END,
          lease_token=NULL, lease_until=NULL, last_error=$4, updated_at=now()
-       WHERE id=$1 AND status='processing' AND lease_token=$2 RETURNING id`,
+       WHERE id=$1 AND status='processing' AND lease_token=$2 AND lease_until > now() RETURNING id`,
       [id, leaseToken, runAfter ?? null, safeError(error)],
     );
     return result.rows.length === 1;

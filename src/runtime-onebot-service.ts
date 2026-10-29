@@ -1,9 +1,16 @@
 import { randomUUID } from 'node:crypto';
+import { safeActionFetch } from './action-url-http.js';
+import { providerSupportsAction } from './provider-capabilities.js';
+import { verifyProviderEventToken } from './provider-event-auth.js';
 import type { AccountConfig } from './config.js';
 import type { NormalizedMessage, Segment } from './normalize.js';
 import type { RuntimeStore } from './postgres-store.js';
 import type { PeerLike, OneBotGateway, ActionResult } from './onebot-service.js';
 import type { OutboundIdempotencyRequest } from './outbound-idempotency-store.js';
+
+export interface RuntimeProviderEventAuth {
+  expectedToken?: string;
+}
 
 export interface OutboundIdempotencyLedger {
   claim(request: OutboundIdempotencyRequest): Promise<{ created: boolean; record: { state: 'pending' | 'complete'; response: unknown | null } }>;
@@ -18,7 +25,8 @@ function outgoing(account: AccountConfig, requestId: string, externalId: string,
   return { id: `${account.id}:${requestId}`, account_id: account.id, provider_id: account.provider, transport_id: `outgoing:${account.id}`, direction: 'outgoing', external_message_id: externalId || null, client_request_id: requestId, event_fingerprint: '', conversation_id: `${account.id}:${type}:${target}`, conversation_type: type, group_id: type === 'group' ? target : null, peer_user_id: type === 'private' ? target : null, sender_id: account.self_id, sender_name: account.alias, sender_card: null, sent_at: now, received_at: now, plain_text: text, raw_message: content, segments, reply_to_message_id: null, at_users: segments.filter(s => s.type === 'at').map(s => String(s.data.qq ?? '')), at_me: false, at_all: false, priority: 'P2', priority_score: 35, requires_reply: false, urgent: false, deadline: null, raw_event: {} };
 }
 export class RuntimeOneBotService implements OneBotGateway {
-  constructor(private readonly peers: Map<string, PeerLike>, private readonly store: RuntimeStore, private readonly timeoutMs = 15000, private readonly idempotency?: OutboundIdempotencyLedger) {}
+  constructor(private readonly peers: Map<string, PeerLike>, private readonly store: RuntimeStore, private readonly timeoutMs = 15000, private readonly idempotency?: OutboundIdempotencyLedger, private readonly eventAuth: RuntimeProviderEventAuth = {}) {}
+  verifyEventToken(provided: string | undefined): boolean { return verifyProviderEventToken(this.eventAuth.expectedToken, provided); }
   async sendMessage(account: AccountConfig, type: 'private' | 'group', target: string, message: string | Segment[], requestId: string): Promise<NormalizedMessage> {
     const saved = (await this.store.list(account.id, 200)).find(m => m.client_request_id === requestId);
     if (saved) {
@@ -46,7 +54,7 @@ export class RuntimeOneBotService implements OneBotGateway {
       const url = `${account.action_url.replace(/\/$/, '')}/${action}`;
       const headers: Record<string, string> = { 'content-type': 'application/json' };
       if (account.access_token) headers.authorization = `Bearer ${account.access_token}`;
-      const httpResponse = await fetch(url, { method: 'POST', headers, body: JSON.stringify(params), signal: AbortSignal.timeout(this.timeoutMs) });
+      const httpResponse = await safeActionFetch(url, { method: 'POST', headers, body: JSON.stringify(params), signal: AbortSignal.timeout(this.timeoutMs) });
       if (!httpResponse.ok) throw Object.assign(new Error(`HTTP OneBot action returned ${httpResponse.status}`), { code: 'ACTION_FAILED' });
       response = await httpResponse.json();
       const result = record(response);
@@ -71,13 +79,14 @@ export class RuntimeOneBotService implements OneBotGateway {
     catch (error) { return { status: 'failed', action: 'delete_msg', error: error instanceof Error ? error.message : 'Action failed' }; }
   }
   async callApi(account: AccountConfig, action: string, params: Record<string, unknown>): Promise<unknown> {
+    if (!providerSupportsAction(account.provider, action)) throw Object.assign(new Error(`Provider ${account.provider} does not declare support for ${action}`), { code: 'ACTION_UNSUPPORTED' });
     const peer = this.peers.get(account.id);
     if (peer?.socket.readyState === 1) return this.call(peer, action, params);
     if (account.action_url) {
       const url = `${account.action_url.replace(/\/$/, '')}/${action}`;
       const headers: Record<string, string> = { 'content-type': 'application/json' };
       if (account.access_token) headers.authorization = `Bearer ${account.access_token}`;
-      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(params), signal: AbortSignal.timeout(this.timeoutMs) });
+      const response = await safeActionFetch(url, { method: 'POST', headers, body: JSON.stringify(params), signal: AbortSignal.timeout(this.timeoutMs) });
       if (!response.ok) throw Object.assign(new Error(`HTTP OneBot action returned ${response.status}`), { code: 'ACTION_FAILED' });
       const value = await response.json(); const result = record(value);
       if (result.status !== 'ok' || Number(result.retcode) !== 0) throw Object.assign(new Error('OneBot action rejected'), { code: 'ACTION_REJECTED' });

@@ -57,7 +57,7 @@ test('stale attempt callbacks cannot replace a newer socket', () => {
   jobs[0]!();
   attempts[1]!.connected();
   attempts[0]!.connected();
+  assert.equal(sockets[0]!.closed, 1);
   assert.equal(client.currentSocket, sockets[1]);
-  assert.ok(sockets[0]!.closed >= 1);
   client.close();
 });
