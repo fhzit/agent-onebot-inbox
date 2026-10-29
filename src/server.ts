@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
+import { createHmac, timingSafeEqual, randomUUID, createHash } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { AccountConfig, AppConfig } from './config.js';
 import type { NormalizedMessage, OneBotEvent } from './normalize.js';
@@ -40,6 +40,8 @@ import { createAttachmentRouteHandler } from './attachments/routes.js';
 import { createOneBotFileRetriever } from './attachments/provider-adapter.js';
 import { PostgresHistoryReconciliationAudit } from './history-reconciliation-audit.js';
 import { getProviderCapabilities } from './provider-capabilities.js';
+import { uploadAndSendAttachment } from './attachments/upload-send-workflow.js';
+import { resolveAllowedFile } from './attachments/sandbox.js';
 
 export type Peer = { account: AccountConfig; socket: WebSocket; connectedAt: number; pending: Map<string, (value: unknown) => void> };
 class MemoryContactsStore implements ContactsStore{private snapshots=new Map<string,ContactsSnapshot>();async get(id:string){return structuredClone(this.snapshots.get(id)??{friends:[],groups:[],members:[],last_synced:{friends:null,groups:null,members:{}}});}async search(accountId:string,query:string,limit=50){const snapshot=await this.get(accountId);const contacts:import('./contact-resolver.js').Contact[]=[...snapshot.friends.map(f=>({account_id:accountId,qq_id:String(f.user_id),...(f.nickname!==undefined?{nickname:f.nickname}:{}),...(f.remark!==undefined?{remark:f.remark}:{})})),...snapshot.members.flatMap(g=>g.members.map(m=>({account_id:accountId,qq_id:String(m.user_id),...(m.nickname!==undefined?{nickname:m.nickname}:{}),...(m.card!==undefined?{card:m.card}:{}),group_id:g.group_id})))];const result=resolveContact(contacts,accountId,query);return{...result,results:result.candidates.slice(0,Math.min(100,Math.max(1,limit)))};}async replaceFriends(id:string,rows:readonly import('./contacts-cache.js').Friend[],syncedAt=new Date()){const s=await this.get(id);s.friends=[...rows];s.last_synced.friends=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroups(id:string,rows:readonly import('./contacts-cache.js').Group[],syncedAt=new Date()){const s=await this.get(id);s.groups=[...rows];s.last_synced.groups=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroupMembers(id:string,groupId:string|number,rows:readonly import('./contacts-cache.js').GroupMember[],syncedAt=new Date()){const s=await this.get(id);s.members=s.members.filter(x=>x.group_id!==String(groupId));s.members.push({group_id:String(groupId),members:[...rows]});s.last_synced.members[String(groupId)]=syncedAt.toISOString();this.snapshots.set(id,s);}}
@@ -197,6 +199,9 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   if (config.accounts.some(a => a.enabled && !a.access_token)) throw new Error('Every enabled account requires access_token');
 const peers = new Map<string, Peer>();
   const onebot = new RuntimeOneBotService(peers, store, 15000, pool ? new PostgresOutboundIdempotencyStore(pool) : undefined, { ...(config.providerEventToken !== undefined ? { expectedToken: config.providerEventToken } : {}) });
+  const durableIdempotency = pool ? new PostgresOutboundIdempotencyStore(pool) : undefined;
+  const memoryAttachmentRequests = new Map<string, { payload: string; response: unknown | null; updatedAt: number }>();
+  const memoryAttachmentRequestLimit = 10_000;
   const contactSearch:ContactsStore=pool?new PostgresContactsStore(pool):new MemoryContactsStore();
   const contactsCache=new ContactsCache();
   const contactsStore:ContactsStore=contactSearch;
@@ -541,6 +546,45 @@ const peers = new Map<string, Peer>();
         }
         if (!target) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Explicit target_id or recipient is required', retryable: false } });
         try {
+          if (body.attachment_path !== undefined) {
+            if (typeof body.attachment_path !== 'string' || !body.attachment_path || typeof body.message !== 'string' || body.message !== '') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'attachment_path requires an empty message', retryable: false } });
+            const roots = (process.env.ATTACHMENT_ALLOWED_ROOTS ?? '').split(path.delimiter).filter(Boolean);
+            const resolved = await resolveAllowedFile(body.attachment_path, roots, attachmentMaxBytes);
+            const requestPayload = { attachment_sha256: createHash('sha256').update(await readFile(resolved.realPath)).digest('hex'), attachment_size: resolved.size, attachment_name: resolved.basename };
+            const attachmentSendRequestId = `${clientRequestId}:attachment-message`;
+            const ledgerPayload = { ...requestPayload, conversation_id: `${account.id}:${type}:${target}`, client_request_id: attachmentSendRequestId };
+            const canonicalRequest = JSON.stringify({ type, target, payload: ledgerPayload });
+            if (pool) {
+              const claim = await durableIdempotency!.claim({ accountId: account.id, requestId: clientRequestId, messageType: type, targetId: target, payload: ledgerPayload });
+              if (!claim.created) {
+                if (claim.record.state === 'complete' && claim.record.response && typeof claim.record.response === 'object') return respond(res, 200, { status: 'duplicate', message: (claim.record.response as { message?: unknown }).message });
+                return respond(res, 409, { error: { code: 'IDEMPOTENCY_IN_PROGRESS', message: 'Attachment send is pending or uncertain; do not retry automatically', retryable: false } });
+              }
+            } else {
+              const key = `${account.id}:${clientRequestId}`;
+              const prior = memoryAttachmentRequests.get(key);
+              if (prior) {
+                prior.updatedAt = Date.now();
+                if (prior.payload !== canonicalRequest) return respond(res, 409, { error: { code: 'IDEMPOTENCY_CONFLICT', message: 'client_request_id was already used for a different attachment send', retryable: false } });
+                if (prior.response && typeof prior.response === 'object') return respond(res, 200, { status: 'duplicate', message: (prior.response as { message?: unknown }).message });
+                return respond(res, 409, { error: { code: 'IDEMPOTENCY_IN_PROGRESS', message: 'Attachment send is pending or uncertain; do not retry automatically', retryable: false } });
+              }
+              for (const [requestKey, request] of memoryAttachmentRequests) {
+                if (request.response && Date.now() - request.updatedAt > 86_400_000) memoryAttachmentRequests.delete(requestKey);
+              }
+              if (memoryAttachmentRequests.size >= memoryAttachmentRequestLimit) return respond(res, 503, { error: { code: 'IDEMPOTENCY_CAPACITY', message: 'In-memory attachment idempotency capacity reached; configure PostgreSQL for durable high-volume sends', retryable: false } });
+              memoryAttachmentRequests.set(key, { payload: canonicalRequest, response: null, updatedAt: Date.now() });
+            }
+            const uploaded = await uploadAndSendAttachment(
+              onebot, account, account.permission, { type, id: target }, resolved.realPath, roots, attachmentMaxBytes, attachmentSendRequestId,
+            );
+            const responseValue = { ...ledgerPayload, message: uploaded.message };
+            if (pool) await durableIdempotency!.complete(account.id, clientRequestId, responseValue);
+            else memoryAttachmentRequests.set(`${account.id}:${clientRequestId}`, { payload: canonicalRequest, response: responseValue, updatedAt: Date.now() });
+            sendSuccess++;
+            if(auditStore)await auditStore.record({actor:'admin',action:'message.send',account_id:account.id,message_id:uploaded.message.id,target_type:type,target_id:target,result:'success',metadata:{attachment:true}});
+            return respond(res, 200, { status: 'sent', message: uploaded.message });
+          }
           if (pool) {
             const outgoing = await onebot.sendMessage(account, type, target, body.message as string | import('./normalize.js').Segment[], clientRequestId);
             sendSuccess++;

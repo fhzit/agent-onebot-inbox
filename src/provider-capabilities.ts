@@ -10,6 +10,7 @@ const COMMON_V11_ACTIONS = [
   'send_private_msg', 'send_group_msg', 'delete_msg', 'get_msg',
   'get_login_info', 'get_stranger_info', 'get_friend_list', 'get_group_info', 'get_group_list',
   'get_group_member_info', 'get_group_member_list', 'get_file', 'get_status',
+  'upload_group_file', 'upload_private_file',
 ] as const;
 
 const ACTION_ALIASES: Readonly<Record<string, readonly string[]>> = Object.freeze({
