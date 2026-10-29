@@ -25,8 +25,6 @@ export async function uploadAndSendAttachment(
   if (permission !== 'direct') throw new Error('Direct permission is required for attachment upload');
   if (typeof requestId !== 'string' || !requestId.trim()) throw new Error('Explicit request ID is required');
   const file = await resolveAllowedFile(inputPath, allowedRoots, maxBytes);
-  // Snapshot the resolved inode before hashing, then upload only this private copy.
-  // The adapter's second path resolution can no longer observe source replacement.
   const snapshotDir = await mkdtemp(path.join(tmpdir(), 'attachment-upload-'));
   const snapshotPath = path.join(snapshotDir, file.basename);
   try {
@@ -45,10 +43,6 @@ export async function uploadAndSendAttachment(
       }
     } finally { await handle.close(); }
     const hash = digest.digest('hex');
-    // The digest is intentionally computed from the same private file path passed
-    // to the provider; source-path changes cannot affect either operation.
-    void hash;
-
     const upload = await uploadAttachment(gateway, account, target, snapshot.realPath, [snapshotDir], maxBytes);
     if (!upload || (upload.provider !== 'napcat' && upload.provider !== 'snowluma') || typeof upload.action !== 'string' || !upload.action || !upload.response || typeof upload.response !== 'object' || Array.isArray(upload.response) || (upload.response as Record<string, unknown>).status !== 'ok' || Number((upload.response as Record<string, unknown>).retcode) !== 0) throw new Error('Attachment upload returned an invalid action result');
     const data = (upload.response as Record<string, unknown>).data;
