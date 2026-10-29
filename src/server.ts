@@ -551,7 +551,7 @@ const peers = new Map<string, Peer>();
             if (typeof body.attachment_path !== 'string' || !body.attachment_path || typeof body.message !== 'string' || body.message !== '') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'attachment_path requires an empty message', retryable: false } });
             const roots = (process.env.ATTACHMENT_ALLOWED_ROOTS ?? '').split(path.delimiter).filter(Boolean);
             const resolved = await resolveAllowedFile(body.attachment_path, roots, attachmentMaxBytes);
-            const requestPayload = { attachment_sha256: createHash('sha256').update(await readFile(resolved.realPath)).digest('hex'), attachment_size: resolved.size, attachment_name: resolved.basename };
+    const requestPayload = { attachment_sha256: createHash('sha256').update(await readFile(resolved.realPath)).digest('hex'), attachment_size: resolved.size, attachment_name: resolved.basename };
             const attachmentSendRequestId = `${clientRequestId}:attachment-message`;
             const ledgerPayload = { ...requestPayload, conversation_id: `${account.id}:${type}:${target}`, client_request_id: attachmentSendRequestId };
             const canonicalRequest = JSON.stringify({ type, target, payload: ledgerPayload });
@@ -579,7 +579,7 @@ const peers = new Map<string, Peer>();
             const uploaded = await uploadAndSendAttachment(
               onebot, account, account.permission, { type, id: target }, resolved.realPath, roots, attachmentMaxBytes, attachmentSendRequestId,
             );
-            const responseValue = { ...ledgerPayload, message: uploaded.message };
+            const responseValue = { ...ledgerPayload, attachment_sha256: uploaded.sha256, message: uploaded.message };
             if (pool) await durableIdempotency!.complete(account.id, clientRequestId, responseValue);
             else memoryAttachmentRequests.set(`${account.id}:${clientRequestId}`, { payload: canonicalRequest, response: responseValue, updatedAt: Date.now() });
             sendSuccess++;
