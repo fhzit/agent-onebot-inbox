@@ -535,6 +535,7 @@ const peers = new Map<string, Peer>();
         const type = body.message_type;
         const requestedTarget = typeof body.target_id === 'string' ? body.target_id : '';
         if (!clientRequestId || (type !== 'private' && type !== 'group') || (typeof body.message !== 'string' && !Array.isArray(body.message)) || body.recipient !== undefined && typeof body.recipient !== 'string') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Explicit client_request_id, target_id or recipient, message_type and message are required', retryable: false } });
+        if (body.attachment_path === undefined && /:attachment-message$/.test(clientRequestId)) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'client_request_id uses a reserved attachment child namespace', retryable: false } });
         let target = requestedTarget;
         if (typeof body.recipient === 'string') {
           if (type !== 'private') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Contact recipients are supported only for private messages', retryable: false } });

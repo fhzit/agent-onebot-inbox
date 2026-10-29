@@ -22,21 +22,22 @@ test('NapCat group upload uses documented action and explicit group fields', asy
   assert.deepEqual(result, { provider: 'napcat', action: 'upload_group_file', response });
 }));
 
-test('SnowLuma private upload uses explicit user_id', async () => fixture(async (root, file) => {
-  const calls: unknown[][] = [];
-  await uploadAttachment({ callApi: async (...args: any[]) => { calls.push(args); return { status: 'ok', retcode: 0 }; } }, account('snowluma'), { type: 'private', id: '456' }, file, [root], 100);
-  assert.equal(calls[0]![1], 'upload_private_file');
-  assert.deepEqual(calls[0]![2], { user_id: '456', file, name: 'report.pdf' });
+test('SnowLuma upload fails closed before making a provider request', async () => fixture(async (root, file) => {
+  let calls = 0;
+  const gateway = { callApi: async () => { calls++; return { status: 'ok', retcode: 0 }; } };
+  await assert.rejects(uploadAttachment(gateway, account('snowluma'), { type: 'private', id: '456' }, file, [root], 100), /not supported/);
+  await assert.rejects(uploadAttachment(gateway, account('snowluma'), { type: 'group', id: '123' }, file, [root], 100), /not supported/);
+  assert.equal(calls, 0);
 }));
 
-test('rejects unsupported providers, out-of-root paths, oversize files, and provider errors', async () => fixture(async (root, file) => {
+test('rejects unsupported providers, out-of-root paths, and oversize files', async () => fixture(async (root, file) => {
   const unused = { callApi: async () => ({ status: 'ok', retcode: 0 }) };
   await assert.rejects(uploadAttachment(unused, account('other'), { type: 'private', id: '1' }, file, [root], 100), /Unsupported/);
   const outsideRoot = path.join(root, 'subroot'); await mkdir(outsideRoot);
   const outside = path.join(root, 'outside'); await writeFile(outside, 'not allowed');
   await assert.rejects(uploadAttachment(unused, account('napcat'), { type: 'private', id: '1' }, outside, [outsideRoot], 100), /File is outside allowed roots/);
   await assert.rejects(uploadAttachment(unused, account('napcat'), { type: 'private', id: '1' }, file, [root], 2), /exceeds configured size/);
-  await assert.rejects(uploadAttachment({ callApi: async () => ({ status: 'failed', retcode: 1 }) }, account('snowluma'), { type: 'group', id: '1' }, file, [root], 100), /action failed/);
+  await assert.rejects(uploadAttachment({ callApi: async () => ({ status: 'failed', retcode: 1 }) }, account('napcat'), { type: 'group', id: '1' }, file, [root], 100), /action failed/);
 }));
 
 test('rejects a non-file path', async () => {

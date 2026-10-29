@@ -32,7 +32,7 @@ NapCat / SnowLuma
 - PostgreSQL schema、migration runner 和 runtime message/Inbox repository 已接线；当前生产容器已通过数据库连接 readiness。备份恢复及真实 provider 行为仍未验证。
 - Hermes Generic V2 通知在 PostgreSQL 模式下通过入站事件进入持久通知队列，由 runtime worker 轮询并投递；队列与 worker 已接线，但 live PostgreSQL migration/queue、重试恢复及真实 webhook/provider E2E 尚未验证。非 PostgreSQL 模式不启用持久队列；投递仍非 exactly-once。
 - PostgreSQL outbound idempotency 已接入发送 runtime（仅 PostgreSQL 模式）；pending/uncertain 请求会阻止自动重试，但不提供 exactly-once 保证。生产/live-provider 行为尚未验收。
-- OneBot `get_file` 附件检索已接入 authenticated `GET /api/attachments/:accountId/:fileId` runtime route，受账号权限、主机 allowlist、根目录 sandbox 和大小限制；上传/send 未实现，真实 provider E2E 未验证。Provider lifecycle controller 仍未接入生产传输。
+- 附件：已合并基线 commit `8baa4a7` 接入带幂等保护的附件发送 API；当前未提交 worktree 进一步加入上传适配器、策略和 API 接线改动，但尚非已部署/已验收功能。上传能力与真实 provider 兼容性未完成资格验证；附件下载 `get_file` runtime API 的安全边界见 API 文档。Provider lifecycle controller 仍是 helper，未接入生产传输。
 
 详见[实现状态与未完成项](docs/status.md)。这不是 NapCat/SnowLuma 完整适配声明；各 provider 的真实兼容性尚未实测。
 
@@ -119,12 +119,12 @@ CLI `unread` 会请求 API 的 `unread=true` 过滤；该标记是 Agent inbox �
 ## Still missing or unverified
 
 - Full NapCat/SnowLuma onboarding, provider capability compatibility, and automatic transport lifecycle/reconnect.
-- Contact/group/member sync and contact search are runtime-wired through authenticated account admin API routes, with memory/PostgreSQL-backed storage and signed pagination cursors; contact-change events and contact-aware send routing remain unimplemented, and live provider behavior is unverified.
+- 联系人/群/成员同步与搜索 API 已接入，但 contact-aware 目标解析仍是未提交 helper，不是发送 runtime 行为。
 - Authenticated, optional OneBot HTTP event token validation is configurable via `ONEBOT_EVENT_TOKEN`; it is separate from the account transport token and is not enabled unless configured.
-- AI classification, summaries, and task extraction.
+- AI：分类入口当前仅为未提交 helper，未接入消息处理 runtime；摘要与任务提取也未实现。
 - Live PostgreSQL validation of the runtime-wired notification queue/worker, retry/restart behavior and delivery outcomes; opt-in bounded per-account digest logic is implemented but live digest delivery is unqualified. No real provider/webhook end-to-end qualification.
 - Audit rows are written to PostgreSQL for sensitive admin actions; API exposure remains read-only. The application role cannot update/delete/truncate audit rows. This does not protect against database-owner tampering, and deployment currently uses a shared application DB role; an independently administered audit sink and retention policy are not implemented.
-- Attachment upload/send, backup/restore drill, user-role management, and full MCP tools/remote transport lifecycle. Authenticated attachment retrieval route exists but lacks real provider E2E qualification.
+- 附件上传、备份/恢复、用户角色和完整 MCP 操作覆盖仍未完成。基线 `8baa4a7` 已接入幂等附件发送 API；当前 worktree 的上传端点与恢复逻辑属于未提交代码，不代表已部署。
 - Real QQ/provider end-to-end, security/load tests, and publicly reachable Cloudflare route validation.
 
 This is still Alpha, not a complete product or production-ready service.

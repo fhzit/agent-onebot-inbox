@@ -32,7 +32,26 @@ test('uploads then sends only the validated provider file_id to explicit target'
   assert.equal(result.message, s.message);
 }));
 
-test('permission denial makes no provider calls', async () => fixture(async (root, file) => {
+test('uploads the hashed snapshot even if the source changes during the upload call', async () => fixture(async (root, file) => {
+  const { readFile } = await import('node:fs/promises');
+  let uploadedBytes: string | undefined;
+  let uploadPath: string | undefined;
+  const gateway = {
+    callApi: async (_account: AccountConfig, _action: string, params: Record<string, unknown>) => {
+      uploadPath = String(params.file);
+      await writeFile(file, 'changed');
+      uploadedBytes = String(await readFile(uploadPath, 'utf8'));
+      return { status: 'ok', retcode: 0, data: { file_id: 'uploaded:snapshot' } };
+    },
+    sendMessage: async () => ({ external_message_id: 'sent' }),
+  } as unknown as Pick<OneBotGateway, 'callApi' | 'sendMessage'>;
+  await uploadAndSendAttachment(gateway, account, 'direct', { type: 'group', id: 'g1' }, file, [root], 100, 'snapshot-test');
+  assert.equal(uploadedBytes, 'data');
+  assert.notEqual(uploadPath, file);
+  await assert.rejects(readFile(uploadPath!), { code: 'ENOENT' }, 'private snapshot is removed after upload and send');
+}));
+
+ test('permission denial makes no provider calls', async () => fixture(async (root, file) => {
   const s = stub();
   await assert.rejects(uploadAndSendAttachment(s.gateway, account, 'read', { type: 'private', id: 'u1' }, file, [root], 100, 'r'), /Direct permission/);
   assert.deepEqual(s.calls, []);

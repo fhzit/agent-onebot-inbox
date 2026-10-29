@@ -1,8 +1,13 @@
 import { fileURLToPath } from 'node:url';
 import { verifyBackupArchive } from './backup-integrity.js';
+import { runBackupRestorePreviewCli } from './backup-restore-cli.js';
 type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.env, fetcher: Fetcher = fetch, print: (text: string) => void = console.log): Promise<void> {
+  if (args[0] === 'backup-restore-preview') {
+    await runBackupRestorePreviewCli(args.slice(1), print);
+    return;
+  }
   if (args[0] === 'backup-verify') {
     if (args.length !== 2 || args[1]!.startsWith('--')) throw new Error('Usage: aoi backup-verify <archive.tar|archive.tar.gz>');
     print(JSON.stringify(await verifyBackupArchive(args[1]!), null, 2));

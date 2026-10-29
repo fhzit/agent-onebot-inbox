@@ -1,6 +1,7 @@
 import type { AccountConfig } from '../config.js';
 import type { OneBotGateway } from '../onebot-service.js';
 import { resolveAllowedFile } from './sandbox.js';
+import { selectAttachmentUploadAction } from '../attachment-upload-policy.js';
 
 export type AttachmentUploadTarget =
   | { type: 'group'; id: string; folder?: string }
@@ -9,12 +10,13 @@ export type AttachmentUploadTarget =
 export type AttachmentUploadResult = { provider: 'napcat' | 'snowluma'; action: string; response: unknown };
 
 /**
- * Uploads a local file through documented NapCat or SnowLuma OneBot actions.
+ * Uploads a local file using an explicitly declared provider action.
  * Caller must enforce direct permission before invoking. Account and target are
  * explicit; paths are resolved through the configured allowlist and size limit.
- * Contract assumes NapCat's upload_group_file/upload_private_file and
- * SnowLuma's corresponding HTTP actions accept a local absolute path in `file`.
- * Streamed-upload support is server/version-dependent; no fallback is attempted.
+ * Upload support is currently enabled only for NapCat; providers without a
+ * verified upload action fail closed. NapCat's upload actions require the
+ * provider/version to accept a local absolute path in `file`.
+ * Streamed-upload support is version-dependent; no fallback is attempted.
  */
 export async function uploadAttachment(
   gateway: Pick<OneBotGateway, 'callApi'>,
@@ -28,8 +30,8 @@ export async function uploadAttachment(
     throw new Error(`Unsupported attachment upload provider: ${account.provider}`);
   }
   if (!account.id || !target.id || !target.id.trim()) throw new Error('Explicit account and target are required');
+  const action = selectAttachmentUploadAction(account.provider, target.type);
   const file = await resolveAllowedFile(inputPath, allowedRoots, maxBytes);
-  const action = target.type === 'group' ? 'upload_group_file' : 'upload_private_file';
   const params: Record<string, unknown> = target.type === 'group'
     ? { group_id: target.id, file: file.realPath, name: file.basename }
     : { user_id: target.id, file: file.realPath, name: file.basename };
