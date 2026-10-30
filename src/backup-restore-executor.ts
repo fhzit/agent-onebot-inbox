@@ -1,4 +1,4 @@
-import { lstat, mkdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, relative, resolve, sep } from 'node:path';
 import { buildBackupRestorePlan, type RestoreArchiveEntry } from './backup-restore-plan.js';
 import type { BackupRestorePreview } from './backup-restore-runtime.js';
@@ -37,24 +37,58 @@ export async function executeBackupRestore(
 
   await mkdir(absoluteRoot, { recursive: true });
   await assertDirectoryNotSymlink(absoluteRoot);
-  const written: string[] = [];
+  const destinations = new Set<string>();
   for (const file of plan) {
     const rel = relative(absoluteRoot, file.destination);
     if (!rel || rel === '..' || rel.startsWith(`..${sep}`)) throw new Error(`Restore destination escapes root: ${file.path}`);
-    const parts = rel.split(sep);
-    let current = absoluteRoot;
-    for (const part of parts.slice(0, -1)) {
-      current = resolve(current, part);
-      try { await mkdir(current); } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      }
-      await assertDirectoryNotSymlink(current);
+    if (destinations.has(file.destination)) throw new Error(`Duplicate restore destination: ${file.path}`);
+    destinations.add(file.destination);
+    await assertSafeParentDirectories(absoluteRoot, rel);
+    try {
+      await lstat(file.destination);
+      throw new Error(`Restore destination already exists: ${file.path}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    // wx prevents overwriting files and also closes the common pre-check race.
-    await writeFile(file.destination, file.data, { flag: 'wx' });
-    written.push(file.destination);
+  }
+
+  const createdDirectories: string[] = [];
+  const written: string[] = [];
+  try {
+    for (const file of plan) {
+      const rel = relative(absoluteRoot, file.destination);
+      const parts = rel.split(sep);
+      let current = absoluteRoot;
+      for (const part of parts.slice(0, -1)) {
+        current = resolve(current, part);
+        try { await mkdir(current); createdDirectories.push(current); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+        await assertDirectoryNotSymlink(current);
+      }
+      // wx prevents overwriting files and also closes the common pre-check race.
+      await writeFile(file.destination, file.data, { flag: 'wx' });
+      written.push(file.destination);
+    }
+  } catch (error) {
+    for (const path of written.reverse()) await rm(path, { force: true }).catch(() => undefined);
+    for (const path of createdDirectories.reverse()) await rm(path, { recursive: false, force: true }).catch(() => undefined);
+    throw error;
   }
   return { mode: 'applied', preview, written };
+}
+
+async function assertSafeParentDirectories(root: string, rel: string): Promise<void> {
+  let current = root;
+  for (const part of rel.split(sep).slice(0, -1)) {
+    current = resolve(current, part);
+    try {
+      await assertDirectoryNotSymlink(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+  }
 }
 
 async function assertDirectoryNotSymlink(path: string): Promise<void> {

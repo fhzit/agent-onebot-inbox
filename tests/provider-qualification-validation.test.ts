@@ -30,7 +30,7 @@ test('normalizes provider and check id while rejecting invalid versions', () => 
   assert.equal(result.provider, 'napcat');
   assert.equal(result.version, '1.2.3');
   assert.equal(result.checks[0]?.id, check.id);
-  for (const version of ['', 'x'.repeat(129), '1.0\u0001']) {
+  for (const version of ['', 'x'.repeat(129), '1.0\u0001', '1.0/2', '1.0\\2']) {
     assert.throws(() => validateProviderQualificationInput({ provider: 'napcat', version, checks: [] }), /version/i);
   }
   assert.throws(() => validateProviderQualificationInput({ provider: 'napcat', version: 1, checks: [] }), /include/i);

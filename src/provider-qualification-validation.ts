@@ -53,7 +53,7 @@ export function validateProviderQualificationInput(input: {
   const provider = input.provider.trim().toLowerCase();
   const version = input.version.trim();
   if (!/^[a-z0-9][a-z0-9._-]*$/.test(provider)) throw new TypeError('Invalid provider identifier');
-  if (!version || version.length > MAX_VERSION_LENGTH || CONTROL_CHARACTERS.test(version)) throw new TypeError('Invalid provider version');
+  if (!version || version.length > MAX_VERSION_LENGTH || version.includes('/') || version.includes('\\') || CONTROL_CHARACTERS.test(version)) throw new TypeError('Invalid provider version');
   const checklist = PROVIDER_QUALIFICATION_CHECKLIST[provider];
   if (!checklist) throw new TypeError(`Unknown provider: ${provider}`);
   const seen = new Set<string>();

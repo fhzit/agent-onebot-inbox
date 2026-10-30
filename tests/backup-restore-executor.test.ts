@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, symlink } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -8,6 +8,35 @@ import { executeBackupRestore } from '../src/backup-restore-executor.js';
 
 const entry = (path: string, value: string) => ({ path, data: Buffer.from(value) });
 const manifest = (...entries: ReturnType<typeof entry>[]) => ({ version: 1, files: entries.map(({ path, data }) => ({ path, size: data.length, sha256: backupSha256(data) })) });
+
+test('preflights every destination before writing any payload', async () => {
+  const parent = await mkdtemp(join(tmpdir(), 'restore-executor-'));
+  const root = join(parent, 'restore');
+  const first = entry('nested/first.txt', 'first');
+  const laterConflict = entry('nested/later.txt', 'archive');
+  try {
+    await mkdir(join(root, 'nested'), { recursive: true });
+    await writeFile(join(root, 'nested/later.txt'), 'existing');
+    await assert.rejects(executeBackupRestore(root, manifest(first, laterConflict), [first, laterConflict], { apply: true }), /already exists/);
+    await assert.rejects(readFile(join(root, 'nested/first.txt')));
+    assert.equal(await readFile(join(root, 'nested/later.txt'), 'utf8'), 'existing');
+  } finally { await rm(parent, { recursive: true, force: true }); }
+});
+
+test('preflights dangling symlink destinations without leaving earlier files', async () => {
+  const parent = await mkdtemp(join(tmpdir(), 'restore-executor-'));
+  const root = join(parent, 'restore');
+  const first = entry('nested/first.txt', 'first');
+  const later = entry('nested/later.txt', 'later');
+  try {
+    // A dangling symlink passes the initial nonexistence check but causes wx to fail.
+    await mkdir(join(root, 'nested'), { recursive: true });
+    await symlink(join(parent, 'missing-target'), join(root, 'nested/later.txt'));
+    await assert.rejects(executeBackupRestore(root, manifest(first, later), [first, later], { apply: true }), /already exists/);
+    await assert.rejects(readFile(join(root, 'nested/first.txt')));
+    assert.equal((await lstat(join(root, 'nested/later.txt'))).isSymbolicLink(), true);
+  } finally { await rm(parent, { recursive: true, force: true }); }
+});
 
 test('dry-run is the default and writes nothing', async () => {
   const parent = await mkdtemp(join(tmpdir(), 'restore-executor-'));
@@ -30,7 +59,7 @@ test('apply creates validated files without overwriting', async () => {
     assert.equal(result.mode, 'applied');
     assert.deepEqual(result.written, [join(root, 'nested/file.txt')]);
     assert.equal(await readFile(join(root, 'nested/file.txt'), 'utf8'), 'payload');
-    await assert.rejects(executeBackupRestore(root, manifest(file), [file], { apply: true }), /EEXIST/);
+    await assert.rejects(executeBackupRestore(root, manifest(file), [file], { apply: true }), /already exists/);
     assert.equal(await readFile(join(root, 'nested/file.txt'), 'utf8'), 'payload');
   } finally { await rm(parent, { recursive: true, force: true }); }
 });
