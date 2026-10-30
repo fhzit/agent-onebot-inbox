@@ -74,7 +74,7 @@ export function createManagedReverseWsClient<T extends { close: () => void }>(op
             events.failed();
           },
         });
-        if (closed || attempt !== generation) candidate.close();
+        if (closed || attempt !== generation) dispose();
         else connecting.add(candidate);
       } catch {
         events.failed();

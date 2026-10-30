@@ -93,6 +93,13 @@ test('serves a local admin UI without embedding secrets or external assets', asy
     assert.match(html, /settingsAccounts/);
     assert.match(html, /API 地址/);
     assert.match(html, /settingsRefresh/);
+    assert.match(html, /qualificationForm/);
+    assert.match(html, /qualificationChecks/);
+    assert.match(html, /provider-qualification\/checklist/);
+    assert.match(html, /provider-qualification/);
+    assert.match(html, /不会自动测试 Provider/);
+    assert.match(html, /保存人工评估/);
+    assert.match(html, /qualificationStatus/);
     assert.match(html, /accountCreateOpen/);
     assert.match(html, /notificationForm/);
     assert.match(html, /notificationTest/);

@@ -26,6 +26,7 @@ import { PostgresOutboundIdempotencyStore } from './outbound-idempotency-store.j
 import { adminPage } from './admin-page.js';
 import {ContactsCache} from './contacts-cache.js';
 import {resolveContact} from './contact-resolver.js';
+import {resolveContactSendTarget} from './contact-send-target.js';
 import {ContactSyncService} from './contact-sync.js';
 import { mapContactChangeEvent } from './contact-change-events.js';
 import {PostgresContactsStore,type ContactsStore, type ContactsSnapshot} from './postgres-contacts-store.js';
@@ -40,8 +41,13 @@ import { createAttachmentRouteHandler } from './attachments/routes.js';
 import { createOneBotFileRetriever } from './attachments/provider-adapter.js';
 import { PostgresHistoryReconciliationAudit } from './history-reconciliation-audit.js';
 import { getProviderCapabilities } from './provider-capabilities.js';
+import { PROVIDER_QUALIFICATION_CHECKLIST } from './provider-qualification.js';
+import { ProviderQualificationStore } from './provider-qualification-store.js';
+import { PostgresProviderQualificationStore } from './provider-qualification-pg-store.js';
 import { uploadAndSendAttachment } from './attachments/upload-send-workflow.js';
 import { resolveAllowedFile } from './attachments/sandbox.js';
+import { classifyIncomingMessage, type ClassificationIngressOptions } from './ai-classification-ingress.js';
+import type { MessageClassifier, Classification } from './ai-classification.js';
 
 export type Peer = { account: AccountConfig; socket: WebSocket; connectedAt: number; pending: Map<string, (value: unknown) => void> };
 class MemoryContactsStore implements ContactsStore{private snapshots=new Map<string,ContactsSnapshot>();async get(id:string){return structuredClone(this.snapshots.get(id)??{friends:[],groups:[],members:[],last_synced:{friends:null,groups:null,members:{}}});}async search(accountId:string,query:string,limit=50){const snapshot=await this.get(accountId);const contacts:import('./contact-resolver.js').Contact[]=[...snapshot.friends.map(f=>({account_id:accountId,qq_id:String(f.user_id),...(f.nickname!==undefined?{nickname:f.nickname}:{}),...(f.remark!==undefined?{remark:f.remark}:{})})),...snapshot.members.flatMap(g=>g.members.map(m=>({account_id:accountId,qq_id:String(m.user_id),...(m.nickname!==undefined?{nickname:m.nickname}:{}),...(m.card!==undefined?{card:m.card}:{}),group_id:g.group_id})))];const result=resolveContact(contacts,accountId,query);return{...result,results:result.candidates.slice(0,Math.min(100,Math.max(1,limit)))};}async replaceFriends(id:string,rows:readonly import('./contacts-cache.js').Friend[],syncedAt=new Date()){const s=await this.get(id);s.friends=[...rows];s.last_synced.friends=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroups(id:string,rows:readonly import('./contacts-cache.js').Group[],syncedAt=new Date()){const s=await this.get(id);s.groups=[...rows];s.last_synced.groups=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroupMembers(id:string,groupId:string|number,rows:readonly import('./contacts-cache.js').GroupMember[],syncedAt=new Date()){const s=await this.get(id);s.members=s.members.filter(x=>x.group_id!==String(groupId));s.members.push({group_id:String(groupId),members:[...rows]});s.last_synced.members[String(groupId)]=syncedAt.toISOString();this.snapshots.set(id,s);}}
@@ -146,7 +152,7 @@ function validateAttachmentActionUrlHosts(accounts: readonly AccountConfig[], ra
     if (!attachmentActionUrlHostAllowed(account, raw)) throw new Error(`Account ${account.id} action_url host must be included in ATTACHMENT_ACTION_URL_ALLOWED_HOSTS`);
   }
 }
-export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string; accountStore?: Pick<AccountStore, 'loadConfiguredAccounts'|'create'>; inboxRules?: readonly InboxRule[]; notificationDigest?: { enabled: boolean; intervalMs?: number; batchSize?: number } } = {}): Promise<Runtime> {
+export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string; accountStore?: Pick<AccountStore, 'loadConfiguredAccounts'|'create'>; inboxRules?: readonly InboxRule[]; notificationDigest?: { enabled: boolean; intervalMs?: number; batchSize?: number }; aiClassification?: { enabled: true; policy: ClassificationIngressOptions; classifier: MessageClassifier } } = {}): Promise<Runtime> {
   if(options.requireDatabase&&!options.databaseUrl)throw new Error('DATABASE_URL is required for durable runtime');
   const attachmentMaxBytes = parseAttachmentMaxBytes(process.env.ATTACHMENT_MAX_BYTES);
   validateAttachmentActionUrlHosts(config.accounts, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS);
@@ -184,6 +190,7 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   }
   store=runtimeStore;
   const notificationDeliveryStore=pool?new PostgresNotificationDeliveryStore(pool):undefined;
+  const qualificationStore = pool ? new PostgresProviderQualificationStore(pool) : new ProviderQualificationStore();
   const notificationQueue=pool?new PostgresNotificationQueue(pool):undefined;
   const priorityStore: PriorityStore = pool ? new PostgresPriorityStore(pool) : new MemoryPriorityStore();
   const accountStore: AccountStore = pool ? new PostgresAccountStore(pool,options.accountEncryptionKey??'') : new MemoryAccountStore();
@@ -287,7 +294,9 @@ const peers = new Map<string, Peer>();
         const normalized = normalizeEvent(account.id, account.provider, `http:${account.id}`, event);
         const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
         if (!message) return respond(res, 200, { status: 'ignored' });
-            const result=await store.insert(message); if(result.inserted)await applyRulesToStoredMessage(result.message); eventCount++; if(!result.inserted)duplicateCount++;else if(auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
+        const advisory = await classifyIncomingMessage(message, options.aiClassification?.policy, options.aiClassification?.classifier);
+        if (advisory) (message as NormalizedMessage & { ai_advisory?: { account_id: string; classification: Classification } }).ai_advisory = { account_id: account.id, classification: advisory };
+        const result=await store.insert(message); if(result.inserted)await applyRulesToStoredMessage(result.message); eventCount++; if(!result.inserted)duplicateCount++;else if(auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
             if(pool)await enqueueNotificationSafely(()=>notificationQueue!.enqueue({event:'message.received',accountId:account.id,messageId:result.message.id,dedupeKey:`message.received:${account.id}:${result.message.id}`}),logger,{account_id:account.id,message_id:result.message.id});
         return respond(res, 200, { status: result.inserted ? 'stored' : 'duplicate', message_id: result.message.id });
       }
@@ -455,6 +464,22 @@ const peers = new Map<string, Peer>();
         });
         return respond(res, 200, { verification: 'declarations_only', capabilities });
       }
+      if (url.pathname.startsWith('/api/admin/provider-qualification')) {
+        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (req.method === 'GET' && url.pathname === '/api/admin/provider-qualification/checklist') return respond(res, 200, { checklist: PROVIDER_QUALIFICATION_CHECKLIST });
+        const match = url.pathname.match(/^\/api\/admin\/provider-qualification\/([^/]+)\/([^/]+)$/);
+        if (req.method === 'GET' && match) {
+          let provider: string; let version: string;
+          try { provider = decodeURIComponent(match[1]!); version = decodeURIComponent(match[2]!); } catch { return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid provider/version path', retryable: false } }); }
+          const record = await qualificationStore.get(provider, version);
+          return record ? respond(res, 200, { record }) : respond(res, 404, { error: { code: 'NOT_FOUND', message: 'Qualification record not found', retryable: false } });
+        }
+        if (req.method === 'PUT' && url.pathname === '/api/admin/provider-qualification') {
+          try { const input = await readBody(req, config.maxMessageBytes) as import('./provider-qualification-store.js').ProviderQualificationRecordInput; const record = await qualificationStore.record(input); return respond(res, 200, { record }); }
+          catch (error) { const invalid = error instanceof TypeError; return respond(res, invalid ? 400 : 503, { error: { code: invalid ? 'VALIDATION_ERROR' : 'PERSISTENCE_ERROR', message: invalid ? (error as Error).message : 'Qualification result unavailable', retryable: !invalid } }); }
+        }
+        return respond(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Unsupported qualification operation', retryable: false } });
+      }
       if (req.method === 'GET' && url.pathname === '/api/admin/accounts') {
         if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
         return respond(res,200,{accounts:config.accounts.map(({access_token:_secret,...a})=>({...a,access_token_configured:Boolean(_secret)}))});
@@ -536,16 +561,21 @@ const peers = new Map<string, Peer>();
         const requestedTarget = typeof body.target_id === 'string' ? body.target_id : '';
         if (!clientRequestId || (type !== 'private' && type !== 'group') || (typeof body.message !== 'string' && !Array.isArray(body.message)) || body.recipient !== undefined && typeof body.recipient !== 'string') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Explicit client_request_id, target_id or recipient, message_type and message are required', retryable: false } });
         if (body.attachment_path === undefined && /:attachment-message$/.test(clientRequestId)) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'client_request_id uses a reserved attachment child namespace', retryable: false } });
-        let target = requestedTarget;
-        if (typeof body.recipient === 'string') {
-          if (type !== 'private') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Contact recipients are supported only for private messages', retryable: false } });
-          const resolution = await contactsStore.search(account.id, body.recipient, 100);
-          if (resolution.status === 'ambiguous') return respond(res, 409, { error: { code: 'AMBIGUOUS_RECIPIENT', message: 'Recipient matches multiple contacts; use an exact QQ ID', retryable: false } });
-          if (resolution.status !== 'resolved') return respond(res, 404, { error: { code: 'RECIPIENT_NOT_FOUND', message: 'Recipient was not found in this account contact list', retryable: false } });
-          if (requestedTarget && requestedTarget !== resolution.contact.qq_id) return respond(res, 400, { error: { code: 'RECIPIENT_TARGET_MISMATCH', message: 'target_id does not match resolved recipient', retryable: false } });
-          target = resolution.contact.qq_id;
-        }
-        if (!target) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Explicit target_id or recipient is required', retryable: false } });
+        if (typeof body.recipient === 'string' && type !== 'private') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Contact recipients are supported only for private messages', retryable: false } });
+        const contactResolution = typeof body.recipient === 'string'
+          ? await contactsStore.search(account.id, body.recipient, 100)
+          : undefined;
+        const targetResolution = resolveContactSendTarget({
+          accountId: account.id,
+          ...(requestedTarget ? { explicitTargetId: requestedTarget } : {}),
+          ...(typeof body.recipient === 'string' ? { recipient: body.recipient } : {}),
+          contacts: contactResolution?.results ?? [],
+        });
+        if (targetResolution.status === 'ambiguous') return respond(res, 409, { error: { code: 'AMBIGUOUS_RECIPIENT', message: 'Recipient matches multiple contacts; use an exact QQ ID', retryable: false } });
+        if (targetResolution.status === 'not_found') return respond(res, 404, { error: { code: 'RECIPIENT_NOT_FOUND', message: 'Recipient was not found in this account contact list', retryable: false } });
+        if (targetResolution.status === 'mismatch') return respond(res, 400, { error: { code: 'RECIPIENT_TARGET_MISMATCH', message: 'target_id does not match resolved recipient', retryable: false } });
+        if (targetResolution.status === 'invalid') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Explicit target_id or recipient is required', retryable: false } });
+        const target = targetResolution.targetId;
         try {
           if (body.attachment_path !== undefined) {
             if (typeof body.attachment_path !== 'string' || !body.attachment_path || typeof body.message !== 'string' || body.message !== '') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'attachment_path requires an empty message', retryable: false } });
@@ -657,6 +687,8 @@ const peers = new Map<string, Peer>();
       const normalized = normalizeEvent(account.id, account.provider, `reverse-ws:${account.id}`, event);
       const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
       if (!message) return;
+      const advisory = await classifyIncomingMessage(message, options.aiClassification?.policy, options.aiClassification?.classifier);
+      if (advisory) (message as NormalizedMessage & { ai_advisory?: { account_id: string; classification: Classification } }).ai_advisory = { account_id: account.id, classification: advisory };
       const result = await store.insert(message); eventCount++; if (!result.inserted) duplicateCount++;
       if (result.inserted) await applyRulesToStoredMessage(result.message);
       if(result.inserted&&auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
