@@ -9,9 +9,29 @@ test('HTTP transient failures include timeout, rate limit, and server errors', (
 });
 
 test('HTTP client failures are permanent while network and unknown errors are transient', () => {
-  assert.deepEqual(classifyNotificationFailure(new Error('HTTP 401')), { retryable: false, category: 'permanent', retryAfterMs: null });
+  for (const status of [400, 401, 403, 404, 422]) {
+    assert.deepEqual(classifyNotificationFailure(new Error(`HTTP ${status}`)), {
+      retryable: false, category: 'permanent', retryAfterMs: null,
+    });
+  }
   assert.equal(classifyNotificationFailure(new TypeError('fetch failed')).retryable, true);
   assert.equal(classifyNotificationFailure('provider unavailable').category, 'transient');
+});
+
+test('HTTP status classification covers retryable boundaries and accepted message forms', () => {
+  for (const status of [408, 429, 500, 599]) {
+    assert.deepEqual(classifyNotificationFailure(new Error(`Hermes webhook returned HTTP ${status}`)), {
+      retryable: true, category: 'transient', retryAfterMs: null,
+    });
+  }
+  assert.deepEqual(classifyNotificationFailure(new Error('http 503: temporarily unavailable')), {
+    retryable: true, category: 'transient', retryAfterMs: null,
+  });
+  assert.deepEqual(classifyNotificationFailure('status 503'), { retryable: true, category: 'transient', retryAfterMs: null });
+  assert.deepEqual(classifyNotificationFailure(''), { retryable: true, category: 'transient', retryAfterMs: null });
+  assert.deepEqual(classifyNotificationFailure(null), {
+    retryable: true, category: 'transient', retryAfterMs: null,
+  });
 });
 
 test('retry delays grow exponentially, cap, and stop on permanent errors or exhausted budget', () => {

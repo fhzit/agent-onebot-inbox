@@ -23,6 +23,7 @@ import { PostgresNotificationDeliveryStore, type NotificationDelivery } from './
 import { MemoryNotificationConfigStore, PostgresNotificationConfigStore, type NotificationConfigStore } from './notification-settings.js';
 import { RuntimeOneBotService } from './runtime-onebot-service.js';
 import { PostgresOutboundIdempotencyStore } from './outbound-idempotency-store.js';
+import type { PostgresIdempotencyReconciliationStorage, AdjudicationOutcome } from './idempotency-reconciliation-storage.js';
 import { adminPage } from './admin-page.js';
 import {ContactsCache} from './contacts-cache.js';
 import {resolveContact} from './contact-resolver.js';
@@ -152,7 +153,7 @@ function validateAttachmentActionUrlHosts(accounts: readonly AccountConfig[], ra
     if (!attachmentActionUrlHostAllowed(account, raw)) throw new Error(`Account ${account.id} action_url host must be included in ATTACHMENT_ACTION_URL_ALLOWED_HOSTS`);
   }
 }
-export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string; accountStore?: Pick<AccountStore, 'loadConfiguredAccounts'|'create'>; inboxRules?: readonly InboxRule[]; notificationDigest?: { enabled: boolean; intervalMs?: number; batchSize?: number }; aiClassification?: { enabled: true; policy: ClassificationIngressOptions; classifier: MessageClassifier } } = {}): Promise<Runtime> {
+export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string; accountStore?: Pick<AccountStore, 'loadConfiguredAccounts'|'create'>; inboxRules?: readonly InboxRule[]; notificationDigest?: { enabled: boolean; intervalMs?: number; batchSize?: number }; aiClassification?: { enabled: true; policy: ClassificationIngressOptions; classifier: MessageClassifier }; idempotencyReconciliation?: Pick<PostgresIdempotencyReconciliationStorage, 'listPending' | 'adjudicate'> } = {}): Promise<Runtime> {
   if(options.requireDatabase&&!options.databaseUrl)throw new Error('DATABASE_URL is required for durable runtime');
   const attachmentMaxBytes = parseAttachmentMaxBytes(process.env.ATTACHMENT_MAX_BYTES);
   validateAttachmentActionUrlHosts(config.accounts, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS);
@@ -367,6 +368,37 @@ const peers = new Map<string, Peer>();
           if(req.method==='DELETE'&&watchPath[1]){let id:string;try{id=decodeURIComponent(watchPath[1]);}catch{return respond(res,400,{error:{code:'VALIDATION_ERROR',message:'Invalid watch person id',retryable:false}});}let removed=false;try{removed=await priorityStore.deleteWatchPerson(id);if(removed)activePriorityConfig=await priorityStore.list();}catch(error){if(auditStore)await auditStore.record({actor:'admin',action:'watch_person.delete',target_type:'watch_person',target_id:id,result:'failure',metadata:{error:error instanceof Error?error.message:'Delete failed'}});return respond(res,500,{error:{code:'PERSISTENCE_ERROR',message:'Could not persist watch-person deletion',retryable:true}});}if(auditStore)await auditStore.record({actor:'admin',action:'watch_person.delete',target_type:'watch_person',target_id:id,result:removed?'success':'failure'});if(!removed)return respond(res,404,{error:{code:'NOT_FOUND',message:'Watch person not found',retryable:false}});return respond(res,200,{deleted:true});}
         }
 
+      if (url.pathname === '/api/admin/idempotency/reconciliation' || url.pathname.startsWith('/api/admin/idempotency/reconciliation/')) {
+        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        const reconciliation = options.idempotencyReconciliation ?? (pool ? new (await import('./idempotency-reconciliation-storage.js')).PostgresIdempotencyReconciliationStorage(pool) : undefined);
+        if (!reconciliation) return respond(res, 503, { error: { code: 'IDEMPOTENCY_UNAVAILABLE', message: 'Durable idempotency reconciliation requires database configuration', retryable: false }, automaticRetry: false });
+        if (req.method === 'GET' && url.pathname === '/api/admin/idempotency/reconciliation') {
+          const accountId = url.searchParams.get('accountId') ?? '';
+          const rawLimit = url.searchParams.get('limit');
+          const limit = rawLimit === null ? 50 : Number(rawLimit);
+          if (!/^[A-Za-z0-9_-]{1,200}$/.test(accountId) || !Number.isInteger(limit) || limit < 1 || limit > 100) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Valid accountId and limit from 1 to 100 are required', retryable: false } });
+          try { return respond(res, 200, { records: (await reconciliation.listPending(accountId, limit)).map(({ accountId: id, requestId, messageType, targetId, state, createdAt, updatedAt }) => ({ accountId: id, requestId, messageType, targetId, state, createdAt, updatedAt })), automaticRetry: false }); }
+          catch { return respond(res, 503, { error: { code: 'IDEMPOTENCY_UNAVAILABLE', message: 'Idempotency reconciliation could not read the database', retryable: true }, automaticRetry: false }); }
+        }
+        const match = url.pathname.match(/^\/api\/admin\/idempotency\/reconciliation\/([^/]+)\/([^/]+)\/adjudicate$/);
+        if (req.method === 'POST' && match) {
+          let accountId: string; let requestId: string;
+          try { accountId = decodeURIComponent(match[1]!); requestId = decodeURIComponent(match[2]!); } catch { return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid accountId or requestId', retryable: false } }); }
+          if (!/^[A-Za-z0-9_-]{1,200}$/.test(accountId) || !/^[A-Za-z0-9._:-]{1,500}$/.test(requestId)) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid accountId or requestId', retryable: false } });
+          try {
+            const body = await readBody(req, Math.min(config.maxMessageBytes, 8192));
+            if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Body must be an object');
+            const value = body as Record<string, unknown>;
+            if (Object.keys(value).some(key => !['outcome', 'note'].includes(key)) || !(['sent', 'not-sent', 'unresolved'] as unknown[]).includes(value.outcome) || typeof value.note !== 'string' || !value.note.trim() || value.note.length > 1000) throw new Error('Invalid adjudication');
+            const result = await reconciliation.adjudicate({ accountId, requestId, outcome: value.outcome as AdjudicationOutcome, note: value.note, actor: 'admin' });
+            return respond(res, 200, { adjudication: result, automaticRetry: false });
+          } catch (error) {
+            if (error instanceof TypeError || error instanceof SyntaxError || error instanceof Error && (error.message === 'BODY_TOO_LARGE' || error.message.startsWith('Invalid') || error.message.startsWith('Body'))) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid idempotency adjudication', retryable: false } });
+            return respond(res, 503, { error: { code: 'IDEMPOTENCY_UNAVAILABLE', message: 'Idempotency adjudication is unavailable', retryable: true }, automaticRetry: false });
+          }
+        }
+        return respond(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Unsupported reconciliation operation', retryable: false } });
+      }
       const failedNotificationPath=url.pathname.match(/^\/api\/admin\/notifications\/failed\/([^/]+)\/retry$/);
       if(req.method==='POST'&&failedNotificationPath){
         if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});

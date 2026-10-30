@@ -2,14 +2,15 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { registerAdditionalMcpTools } from '../src/mcp-additional-tools.js';
+import { createMcpService } from '../src/mcp.js';
+import { loadConfig } from '../src/config.js';
+import { MessageStore } from '../src/store.js';
 
 async function setup() {
-  const server = new McpServer({ name: 'test', version: '1' });
   const seen: string[] = [];
   const handler = async (id: string) => { seen.push(id); return { account: id, status: 'ok', webhookSecret: 'do-not-return', nested: { apiToken: 'also-secret' } }; };
-  registerAdditionalMcpTools(server, { contacts: handler, groups: handler, health: handler, notificationStatus: handler });
+  const service = createMcpService(loadConfig({ ACCOUNTS_JSON: '[]', API_TOKEN: 'token' }), new MessageStore(), undefined, undefined, { contacts: handler, groups: handler, health: handler, notificationStatus: handler });
+  const server = service.server;
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'test-client', version: '1' });
   await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
@@ -40,14 +41,15 @@ test('additional tools reject missing, blank, and malformed account IDs before h
   await client.close();
 });
 
-test('handler errors return a generic error without leaking details', async () => {
-  const server = new McpServer({ name: 'test', version: '1' });
-  registerAdditionalMcpTools(server, { contacts: async () => { throw new Error('secret token value'); }, groups: async () => null, health: async () => null, notificationStatus: async () => null });
-  const [ct, st] = InMemoryTransport.createLinkedPair();
+test('createMcpService registers and exposes admin tools when handlers are supplied', async () => {
+  const noop = async () => null;
+  const service = createMcpService(loadConfig({ ACCOUNTS_JSON: '[]', API_TOKEN: 'token' }), new MessageStore(), undefined, undefined, { contacts: noop, groups: noop, health: noop, notificationStatus: noop });
+  const tools = (service.server as unknown as { _registeredTools: Record<string, unknown> })._registeredTools;
+  for (const name of ['admin_contacts', 'admin_groups', 'admin_health', 'admin_notification_status']) assert.ok(tools[name], `${name} should be registered`);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'test-client', version: '1' });
-  await Promise.all([client.connect(ct), server.connect(st)]);
-  const result = await client.callTool({ name: 'admin_contacts', arguments: { account_id: 'a' } });
-  assert.equal(result.isError, true);
-  assert.equal((result.content as Array<{ text: string }>)[0]!.text, 'Unable to read account status');
+  await Promise.all([client.connect(clientTransport), service.server.connect(serverTransport)]);
+  const listed = await client.listTools();
+  for (const name of ['admin_contacts', 'admin_groups', 'admin_health', 'admin_notification_status']) assert.ok(listed.tools.some(tool => tool.name === name), `${name} should be discoverable`);
   await client.close();
 });

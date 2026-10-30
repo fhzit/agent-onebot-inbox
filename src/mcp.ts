@@ -12,14 +12,16 @@ import { registerGroupMembersTool } from './mcp-group-members.js';
 import { registerConversationHistoryTool } from './mcp-history.js';
 import { registerTaskExtractionTool } from './mcp-task-extraction.js';
 import { retrieveAttachment, type ProviderFileRetriever } from './attachments/retrieval.js';
+import { registerAdditionalMcpTools, type AdditionalMcpHandlers } from './mcp-additional-tools.js';
 
 export type McpAttachmentService = { allowedRoots: readonly string[]; maxBytes: number; resolveAccount: (accountId: string) => { permission: string; retrieve: ProviderFileRetriever } | undefined | Promise<{ permission: string; retrieve: ProviderFileRetriever } | undefined> };
 
 export interface McpService { server: McpServer; connectStdio(): Promise<void>; createHttpTransport(): StreamableHTTPServerTransport; }
 
-export function createMcpService(config: AppConfig, store: MessageStore | PostgresMessageStore, contactSearch?: Pick<ContactsStore, 'search' | 'get'>, attachments?: McpAttachmentService): McpService {
+export function createMcpService(config: AppConfig, store: MessageStore | PostgresMessageStore, contactSearch?: Pick<ContactsStore, 'search' | 'get'>, attachments?: McpAttachmentService, adminHandlers?: AdditionalMcpHandlers): McpService {
   const server = new McpServer({ name: 'agent-onebot-inbox', version: '0.1.0' });
   if(contactSearch){registerContactsSearchTool(server,contactSearch);registerContactsListTool(server,contactSearch);registerGroupMembersTool(server,contactSearch);}
+  if(adminHandlers) registerAdditionalMcpTools(server, adminHandlers);
   registerConversationHistoryTool(server, store);
   registerTaskExtractionTool(server, store);
   server.registerTool('accounts_list', { description: 'List configured accounts and their enabled/permission status.', inputSchema: {} }, async () => ({ content: [{ type: 'text', text: JSON.stringify(config.accounts.map(({id, alias, self_id, provider, enabled, permission}) => ({id, alias, self_id, provider, enabled, permission}))) }] }));

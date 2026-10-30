@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { startServer } from '../src/server.js';
 
 const account = { id: 'main', alias: 'Main', self_id: '10001', provider: 'napcat', enabled: true, access_token: 'transport-secret', permission: 'direct' as const };
@@ -14,18 +15,33 @@ test('admin message renderer replaces the login placeholder after messages load'
   assert.match(script.slice(script.indexOf('function renderMessages(messages){'), script.indexOf('async function action(')), /\$\('messages'\)\.innerHTML=/);
 });
 
-test('admin embedded script parses successfully', async () => {
+test('admin embedded script parses in async wrapper and retains qualification/idempotency UI logic', async () => {
   const { adminPage } = await import('../src/admin-page.js');
-  const script = adminPage.slice(adminPage.indexOf('<script>') + 8, adminPage.indexOf('</script>'));
-  const { writeFile } = await import('node:fs/promises');
-  const { spawnSync } = await import('node:child_process');
+  const scriptStart = adminPage.indexOf('<script>');
+  const scriptEnd = adminPage.indexOf('</script>', scriptStart);
+  assert.notEqual(scriptStart, -1, 'admin page must contain an inline script');
+  assert.notEqual(scriptEnd, -1, 'inline admin script must be closed');
+  const script = adminPage.slice(scriptStart + '<script>'.length, scriptEnd);
+  assert.ok(script.length > 1000, 'embedded admin script should not be empty or truncated');
+
+  // The browser executes this script in an async function; parsing it as a
+  // standalone script misses syntax regressions involving await/top-level scope.
+  const wrappedScript = `(async function adminInlineScript(){\n${script}\n})()`;
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'aoi-admin-js-'));
   const file = path.join(tempDir, 'inline.js');
   try {
-    await writeFile(file, script);
+    await writeFile(file, wrappedScript);
     const check = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
-    assert.equal(check.status, 0, check.stderr);
+    assert.equal(check.status, 0, `inline admin script failed to parse:\n${check.stderr}\n${check.stdout}`);
   } finally { await rm(tempDir, { recursive: true, force: true }); }
+
+  assert.match(script, /qualificationForm/);
+  assert.match(script, /qualificationChecks/);
+  assert.match(script, /provider-qualification\/checklist/);
+  assert.match(script, /qualificationStatus/);
+  assert.ok(script.includes("/api/admin/idempotency/reconciliation"));
+  assert.match(script, /function loadIdempotencyRecords\(/);
+  assert.match(script, /async function adjudicateIdempotency\(/);
 });
 
 test('admin audit endpoint rejects unauthenticated, invalid pagination, and reports unavailable persistent storage',async()=>{

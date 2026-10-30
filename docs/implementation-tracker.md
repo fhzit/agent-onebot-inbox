@@ -11,7 +11,9 @@
 
 ## Remaining product work (do not claim complete)
 - [x] Contact/group/member sync and contact search are wired to authenticated account admin API routes, with memory/PostgreSQL-backed contact storage and signed pagination cursors; provider contact-change event sync, contact-aware send routing, and live provider qualification remain open.
-- [ ] production qualification of send/revoke and durable idempotency; reconcile pending/uncertain outcomes (no exactly-once guarantee)
+- [x] History reconciliation dry-run preview: bounded provider history fetch, comparison with local messages, existing/missing/duplicate classification, audit record; does not import or mutate messages, and runtime/provider qualification remains open.
+- [x] Authenticated operator inspection of pending outbound idempotency records (bounded to 100; no automatic retry) and durable adjudication persistence/API are wired in server runtime when PostgreSQL is available. Adjudication appends operator evidence only; it does not change the send ledger, retry, or repair messages. PostgreSQL migration and live database/deployment behavior remain unqualified; no exactly-once guarantee.
+- [ ] Production qualification of send/revoke and durable idempotency; any recovery workflow beyond inspection and append-only adjudication of evidence.
 - [x] authenticated attachment retrieval route via OneBot `get_file`, with account permission, allowlist, sandbox and size controls (real provider E2E unverified)
 - [x] attachment upload/send via authenticated API, with request idempotency and allowlisted file validation (NapCat upload supported; SnowLuma fails closed until verified; see `docs/attachment-upload.md`)
 - [x] Inbox state: unread/seen, processed, and dismissed are separate Agent-side states (not QQ read state); API supports one state filter per request and individual processed/dismiss actions. Inbox UI provides state actions, mark-all-seen, and group names.
