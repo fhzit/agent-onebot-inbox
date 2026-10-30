@@ -35,6 +35,7 @@ test('memory-mode attachment idempotency claims the key before async file work',
     const post = () => fetch(`http://127.0.0.1:${port}/api/messages/send`, { method: 'POST', headers: { authorization: 'Bearer api-secret', 'content-type': 'application/json' }, body: JSON.stringify(payload) });
     try {
       const firstRequest = post();
+      await uploadStarted;
       const second = await post();
       const secondBody = await second.json() as { error?: { code?: string } };
       assert.equal(second.status, 409);
