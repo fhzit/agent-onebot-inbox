@@ -32,8 +32,16 @@ const inline = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!inline) throw new Error('admin inline script is missing');
 let script = inline[1].replace('\n})(\);', '\n})(\);');
 const transpileModule = async (file) => {
-  const source = ts.transpileModule(await readFile(path.join(root, 'src', file), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
-  return source.replace(/^export\s+/gm, '');
+  // ESNext keeps plain `export` keywords; CommonJS emits an `exports` shim that
+  // throws in the browser and would abort the rest of the inline script.
+  const emitted = ts.transpileModule(await readFile(path.join(root, 'src', file), 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+  }).outputText;
+  return emitted
+    .replace(/^export\s+(?=(?:function|const|let|var|class)\b)/gm, '')
+    .replace(/^Object\.defineProperty\(exports,[^\n]*\n/gm, '')
+    .replace(/^exports\.[A-Za-z0-9_$]+\s*=[^\n]*\n/gm, '')
+    .replace(/^"use strict";\n/gm, '');
 };
 for (const name of ['admin-ai-advisory-panel.ts', 'admin-ai-advisory-retention-panel.ts', 'admin-contact-sync-panel.ts', 'admin-account-selector-hydration.ts', 'admin-inbox-conversations.ts']) script += "\n" + await transpileModule(name);
 
