@@ -143,6 +143,7 @@ export function bindInboxChat(options: InboxChatOptions): { refresh(): void } {
 
   function renderList(): void {
     const needle = query.trim().toLowerCase();
+    const multiAccount = new Set(conversations.map(item => item.account_id)).size > 1;
     const visible = conversations.filter(item => {
       if (!needle) return true;
       return `${conversationTitle(item)} ${item.last_message.plain_text} ${item.last_message.sender_name ?? ''}`.toLowerCase().includes(needle);
@@ -196,6 +197,12 @@ export function bindInboxChat(options: InboxChatOptions): { refresh(): void } {
         tag.className = 'chat-tag';
         tag.textContent = '群';
         top.insertBefore(tag, name);
+      }
+      if (multiAccount) {
+        const account = root.createElement('span');
+        account.className = 'chat-tag chat-tag-account';
+        account.textContent = accountAlias(item.account_id);
+        top.insertBefore(account, name);
       }
 
       body.append(top, bottom);
