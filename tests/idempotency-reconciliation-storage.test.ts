@@ -96,3 +96,16 @@ test('pending list limit is validated', async () => {
   await assert.rejects(store.listPending('acct', 0), /limit/);
   await assert.rejects(store.listPending('acct', 101), /limit/);
 });
+
+test('adjudication history is bounded, validated, and deterministically ordered', async () => {
+  const { pool, calls } = fakePool(); const store = new PostgresIdempotencyReconciliationStorage(pool);
+  await store.listAdjudications('acct', 'pending');
+  assert.ok(calls[0]!.includes('ORDER BY created_at,id LIMIT $3'));
+  assert.deepEqual(calls[0] && ['acct', 'pending', 50], ['acct', 'pending', 50]);
+  calls.length = 0;
+  await store.listAdjudications('acct', 'pending', 100);
+  assert.deepEqual(calls[0] && ['acct', 'pending', 100], ['acct', 'pending', 100]);
+  await assert.rejects(store.listAdjudications('acct', 'pending', 0), /limit/);
+  await assert.rejects(store.listAdjudications('acct', 'pending', 101), /limit/);
+  await assert.rejects(store.listAdjudications('acct', 'pending', 1.5), /limit/);
+});

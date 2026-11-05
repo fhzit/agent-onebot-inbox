@@ -11,6 +11,8 @@ test('audit marks declarations unverified and lists providers/actions determinis
   assert.deepEqual(report.providers.map(provider => provider.provider), ['napcat', 'snowluma']);
   assert.ok(report.providers.every(provider => provider.verification === 'unverified'));
   assert.ok(report.providers.every(provider => provider.actions.includes('send_private_msg')));
+  assert.ok(report.providers.find(provider => provider.provider === 'napcat')?.actions.includes('upload_group_file'));
+  assert.ok(!report.providers.find(provider => provider.provider === 'snowluma')?.actions.includes('upload_group_file'));
   assert.deepEqual(report.aliases, [
     ['get_group_member_info', 'get_group_member_info_v2'],
     ['get_group_member_list', 'get_group_member_list_v2'],

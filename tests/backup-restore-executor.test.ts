@@ -64,6 +64,20 @@ test('apply creates validated files without overwriting', async () => {
   } finally { await rm(parent, { recursive: true, force: true }); }
 });
 
+test('rejects root reached through a symlinked ancestor', async () => {
+  const parent = await mkdtemp(join(tmpdir(), 'restore-executor-'));
+  const outside = join(parent, 'outside');
+  const alias = join(parent, 'alias');
+  const root = join(alias, 'restore');
+  const file = entry('nested/file.txt', 'payload');
+  try {
+    await mkdir(outside);
+    await symlink(outside, alias);
+    await assert.rejects(executeBackupRestore(root, manifest(file), [file], { apply: true }), /real directory/);
+    await assert.rejects(readFile(join(outside, 'restore', 'nested', 'file.txt')));
+  } finally { await rm(parent, { recursive: true, force: true }); }
+});
+
 test('rejects symlinked root and nested directories during apply', async () => {
   const parent = await mkdtemp(join(tmpdir(), 'restore-executor-'));
   const outside = join(parent, 'outside');

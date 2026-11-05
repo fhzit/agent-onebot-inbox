@@ -11,6 +11,8 @@ export const DEFAULT_CLASSIFICATION_HTTP_MAX_RESPONSE_BYTES = 16_384;
 export type HttpClassificationOptions = Readonly<{
   /** Full OAI-compatible chat-completions endpoint. No query, fragment or userinfo allowed. */
   endpoint: string;
+  /** Provider model identifier used for the chat-completions request. */
+  model: string;
   /** Optional bearer credential; never included in errors or logs. */
   apiKey?: string;
   timeoutMs?: number;
@@ -26,6 +28,7 @@ export function createHttpMessageClassifier(options: HttpClassificationOptions):
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new RangeError('timeoutMs must be between 1 and 120000');
   if (!Number.isInteger(maxResponseBytes) || maxResponseBytes < 1 || maxResponseBytes > 1_048_576) throw new RangeError('maxResponseBytes must be between 1 and 1048576');
   if (options.apiKey !== undefined && (typeof options.apiKey !== 'string' || !options.apiKey.trim())) throw new TypeError('apiKey must be a non-empty string');
+  if (typeof options.model !== 'string' || !options.model.trim()) throw new TypeError('model must be a non-empty string');
   const fetchImpl = options.fetch ?? safeActionFetch as unknown as typeof globalThis.fetch;
   if (typeof fetchImpl !== 'function') throw new TypeError('fetch implementation is unavailable');
 
@@ -41,7 +44,7 @@ export function createHttpMessageClassifier(options: HttpClassificationOptions):
             ...(options.apiKey === undefined ? {} : { authorization: `Bearer ${options.apiKey}` }),
           },
           body: JSON.stringify({
-            model: 'classification',
+            model: options.model,
             temperature: 0,
             messages: [
               { role: 'system', content: `Classify the message using exactly one supplied label. Return only JSON with label, confidence (0 to 1), and optional reason (at most ${MAX_CLASSIFICATION_REASON_CHARS} characters).` },

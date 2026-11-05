@@ -14,9 +14,27 @@ export function auditProviderCapabilities(source) {
   }
   const strings = text => [...text.matchAll(/'([^']+)'/g)].map(match => match[1]);
   const common = strings(commonMatch[1]);
+  // Resolve only known constant arrays with literal members and simple spreads.
+  // Unknown identifiers/spread expressions fail closed rather than guessing.
+  const declarations = new Map([['COMMON_V11_ACTIONS', common]]);
+  for (const match of source.matchAll(/const\s+(\w+)\s*=\s*\[([\s\S]*?)\]\s*as const/g)) {
+    const [, name, body] = match;
+    if (name === 'COMMON_V11_ACTIONS') continue;
+    const actions = [];
+    const entries = body.split(',').map(entry => entry.trim()).filter(Boolean);
+    let valid = true;
+    for (const entry of entries) {
+      const spread = entry.match(/^\.\.\.([\w]+)$/);
+      const literal = entry.match(/^'([^']+)'$/);
+      if (spread && declarations.has(spread[1])) actions.push(...declarations.get(spread[1]));
+      else if (literal) actions.push(literal[1]);
+      else { valid = false; break; }
+    }
+    if (valid) declarations.set(name, actions);
+  }
   const providers = [];
   for (const match of registryMatch[1].matchAll(/([\w-]+)\s*:\s*([\w]+)\s*,?/g)) {
-    const actions = match[2] === 'COMMON_V11_ACTIONS' ? [...common] : null;
+    const actions = declarations.has(match[2]) ? [...declarations.get(match[2])] : null;
     if (!actions) throw new Error(`Unknown action declaration ${match[2]} for ${match[1]}`);
     providers.push({
       provider: match[1], verification: 'unverified',

@@ -15,35 +15,29 @@ function seed(count: number) {
   return store;
 }
 
-test('conversation_history pages backwards from anchor in chronological order', async () => {
-  const store = seed(8);
-  const messages = store.query({ limit: 8 }).messages;
-  const anchor = messages.find(m => m.plain_text === 'msg-6')!;
-  const service = createMcpService(loadConfig({ ACCOUNTS_JSON: '[]', API_TOKEN: 'token' }), store).server;
+test('MCP withholds data tools without a trusted caller principal', async () => {
+  const config = loadConfig({ API_TOKEN: 'test', ACCOUNTS_JSON: '[]' });
+  const service = createMcpService(config, new MessageStore()).server;
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: 'history-test', version: '1' });
+  const client = new Client({ name: 'fail-closed-test', version: '1' });
   await Promise.all([service.connect(serverTransport), client.connect(clientTransport)]);
-  try {
-    const first = await client.callTool({ name: 'conversation_history', arguments: { message_id: anchor.id, limit: 2 } });
-    const firstData = JSON.parse((first.content as Array<{text:string}>)[0]!.text);
-    assert.deepEqual(firstData.messages.map((m: {plain_text:string}) => m.plain_text), ['msg-4', 'msg-5']);
-    assert.equal(firstData.has_more, true);
-    const second = await client.callTool({ name: 'conversation_history', arguments: { message_id: anchor.id, offset: 2, limit: 2 } });
-    const secondData = JSON.parse((second.content as Array<{text:string}>)[0]!.text);
-    assert.deepEqual(secondData.messages.map((m: {plain_text:string}) => m.plain_text), ['msg-2', 'msg-3']);
-  } finally { await client.close(); await service.close(); }
+  try { const { tools } = await client.listTools();
+  assert.deepEqual(tools.map(tool => tool.name), ['service_info', 'system_status']);
+  const status = await client.callTool({ name: 'system_status', arguments: {} });
+  assert.deepEqual(status.content, [{ type: 'text', text: JSON.stringify({ service: 'agent-onebot-inbox', version: '0.1.0', status: 'ok', capabilities: { account_data: false, message_data: false, contacts: false, attachments: false, administration: false } }) }]);
+  assert.equal(status.isError, undefined); }
+  finally { await client.close(); await service.close(); }
 });
 
-test('conversation_history rejects offsets beyond bounded context', async () => {
-  const store = seed(2);
-  const anchor = store.query({ limit: 1 }).messages[0]!;
-  const service = createMcpService(loadConfig({ ACCOUNTS_JSON: '[]', API_TOKEN: 'token' }), store).server;
+test('MCP withholds history tools without a trusted caller principal', async () => {
+  const service = createMcpService(loadConfig({ ACCOUNTS_JSON: '[]', API_TOKEN: 'token' }), seed(2)).server;
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'history-test', version: '1' });
   await Promise.all([service.connect(serverTransport), client.connect(clientTransport)]);
-  try {
-    const result = await client.callTool({ name: 'conversation_history', arguments: { message_id: anchor.id, offset: 99, limit: 10 } });
-    const data = JSON.parse((result.content as Array<{text:string}>)[0]!.text);
-    assert.deepEqual(data, { messages: [], offset: 99, limit: 1, has_more: false });
-  } finally { await client.close(); await service.close(); }
+  try { const { tools } = await client.listTools();
+  assert.deepEqual(tools.map(tool => tool.name), ['service_info', 'system_status']);
+  const status = await client.callTool({ name: 'system_status', arguments: {} });
+  assert.deepEqual(status.content, [{ type: 'text', text: JSON.stringify({ service: 'agent-onebot-inbox', version: '0.1.0', status: 'ok', capabilities: { account_data: false, message_data: false, contacts: false, attachments: false, administration: false } }) }]);
+  assert.equal(status.isError, undefined); }
+  finally { await client.close(); await service.close(); }
 });

@@ -39,7 +39,16 @@ function requiredText(value: string, name: string, maxLength: number): string {
   return value;
 }
 
-/** Inspection and audit only; this store never sends or changes the outbound ledger state. */
+/**
+ * Inspection and audit only; this store never sends or changes the outbound ledger state.
+ *
+ * The pending-row lock serializes this audit insert against a completion UPDATE: if
+ * completion commits first, PostgreSQL rechecks the SELECT predicate after waiting
+ * and this method rejects the adjudication. It cannot prove a `not-sent` assertion
+ * safe against an external send already in flight whose completion UPDATE has not
+ * acquired the row yet. The sender currently does not hold a database lock across
+ * the external send, so adjudications are evidence, not authoritative send state.
+ */
 export class PostgresIdempotencyReconciliationStorage {
   constructor(private readonly pool: ReconciliationPool) {}
 
@@ -81,13 +90,14 @@ export class PostgresIdempotencyReconciliationStorage {
     } finally { client.release(); }
   }
 
-  async listAdjudications(accountId: string, requestId: string): Promise<IdempotencyAdjudication[]> {
+  async listAdjudications(accountId: string, requestId: string, limit = 50): Promise<IdempotencyAdjudication[]> {
     requiredText(accountId, 'accountId', MAX_ACTOR_LENGTH);
     requiredText(requestId, 'requestId', 500);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIST_LIMIT) throw new RangeError(`limit must be an integer between 1 and ${MAX_LIST_LIMIT}`);
     const result = await this.pool.query<Record<string, unknown>>(
       `SELECT id,account_id,client_request_id,outcome,note,actor,created_at
-       FROM outbound_idempotency_adjudications WHERE account_id=$1 AND client_request_id=$2 ORDER BY created_at,id`,
-      [accountId, requestId]);
+       FROM outbound_idempotency_adjudications WHERE account_id=$1 AND client_request_id=$2 ORDER BY created_at,id LIMIT $3`,
+      [accountId, requestId, limit]);
     return result.rows.map(row => ({ id: String(row.id), accountId: String(row.account_id), requestId: String(row.client_request_id), outcome: row.outcome as AdjudicationOutcome, note: String(row.note), actor: String(row.actor), createdAt: row.created_at as Date | string }));
   }
 }

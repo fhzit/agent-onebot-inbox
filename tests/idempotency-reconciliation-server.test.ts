@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { startServer } from '../src/server.js';
 import type { PostgresIdempotencyReconciliationStorage } from '../src/idempotency-reconciliation-storage.js';
 
-type Adapter = Pick<PostgresIdempotencyReconciliationStorage, 'listPending' | 'adjudicate'>;
+type Adapter = Pick<PostgresIdempotencyReconciliationStorage, 'listPending' | 'adjudicate' | 'listAdjudications'>;
 const account = { id: 'acct-1', alias: 'Main', self_id: '10001', provider: 'napcat', enabled: true, access_token: 'transport-secret', permission: 'direct' as const };
 const record = { accountId: 'acct-1', requestId: 'request-1', messageType: 'private' as const, targetId: '42', state: 'pending' as const, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:01.000Z' };
 async function withServer(adapter?: Adapter, configure?: (a: Adapter) => void) {
@@ -15,7 +15,7 @@ const auth = { authorization: 'Bearer api-secret' };
 
 test('reconciliation route authenticates, lists redacted pending records, and never sends', async () => {
   const calls: string[] = [];
-  const adapter: Adapter = { async listPending(id, limit) { calls.push(`list:${id}:${limit}`); return [record, { ...record, payload: 'must not leak', response: 'secret response' } as never]; }, async adjudicate(input) { calls.push(`adjudicate:${input.requestId}`); return { id: 'adj-1', ...input, createdAt: 'now' }; } };
+  const adapter: Adapter = { async listPending(id, limit) { calls.push(`list:${id}:${limit}`); return [record, { ...record, payload: 'must not leak', response: 'secret response' } as never]; }, async listAdjudications() { return []; }, async adjudicate(input) { calls.push(`adjudicate:${input.requestId}`); return { id: 'adj-1', ...input, createdAt: 'now' }; } };
   const { runtime, url } = await withServer(adapter);
   try {
     assert.equal((await fetch(url)).status, 401);
@@ -32,7 +32,7 @@ test('reconciliation route authenticates, lists redacted pending records, and ne
 
 test('reconciliation route rejects invalid queries, unknown routes, and unsupported methods', async () => {
   const calls: string[] = [];
-  const adapter: Adapter = { async listPending(id, limit) { calls.push(`list:${id}:${limit}`); return []; }, async adjudicate(input) { calls.push(`adjudicate:${input.requestId}`); return { id: 'adj-1', ...input }; } };
+  const adapter: Adapter = { async listPending(id, limit) { calls.push(`list:${id}:${limit}`); return []; }, async listAdjudications() { return []; }, async adjudicate(input) { calls.push(`adjudicate:${input.requestId}`); return { id: 'adj-1', ...input }; } };
   const { runtime, url } = await withServer(adapter);
   try {
     for (const query of ['accountId=', 'accountId=bad%2Fid', 'accountId=acct-1&limit=0', 'accountId=acct-1&limit=101', 'accountId=acct-1&limit=1.5']) {
@@ -48,7 +48,7 @@ test('reconciliation route rejects invalid queries, unknown routes, and unsuppor
 
 test('reconciliation POST authenticates and rejects malformed or oversized bodies without adjudicating', async () => {
   const calls: unknown[] = [];
-  const adapter: Adapter = { async listPending() { return []; }, async adjudicate(input) { calls.push(input); return { id: 'adj-1', ...input }; } };
+  const adapter: Adapter = { async listPending() { return []; }, async listAdjudications() { return []; }, async adjudicate(input) { calls.push(input); return { id: 'adj-1', ...input }; } };
   const { runtime, url } = await withServer(adapter);
   try {
     const path = `${url}/acct-1/request-1/adjudicate`;
@@ -67,9 +67,54 @@ test('reconciliation route reports unavailable storage and query failure safely'
   try { const response = await fetch(`${failing.url}?accountId=acct-1`, { headers: auth }); assert.equal(response.status, 503); assert.doesNotMatch(await response.text(), /sensitive/); } finally { await failing.runtime.close(); }
 });
 
+test('history endpoint returns only the exact account and request scope', async () => {
+  const calls: unknown[][] = [];
+  const adjudication = { id: 'adj-1', accountId: 'acct-1', requestId: 'request-1', outcome: 'sent' as const, note: 'confirmed', actor: 'admin', createdAt: '2026-01-02T00:00:00.000Z' };
+  const adapter: Adapter = { async listPending() { return []; }, async adjudicate() { throw new Error('not used'); }, async listAdjudications(accountId, requestId) { calls.push([accountId, requestId]); return [adjudication, { ...adjudication, payload: 'must not leak' } as never]; } };
+  const { runtime, url } = await withServer(adapter);
+  try {
+    const path = `${url}/acct-1/request-1/history`;
+    assert.equal((await fetch(path)).status, 401);
+    const response = await fetch(path, { headers: auth });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { adjudications: [adjudication, adjudication] });
+    assert.deepEqual(calls, [['acct-1', 'request-1']]);
+  } finally { await runtime.close(); }
+});
+
+test('history endpoint validates identifiers and reports unavailable or failed storage safely', async () => {
+  const adapter: Adapter = { async listPending() { return []; }, async adjudicate() { throw new Error('not used'); }, async listAdjudications() { return []; } };
+  const { runtime, url } = await withServer(adapter);
+  try {
+    for (const path of [`${url}/bad%2Fid/request-1/history`, `${url}/acct-1/bad%2Fid/history`, `${url}/acct-1/${'x'.repeat(501)}/history`]) {
+      const response = await fetch(path, { headers: auth });
+      assert.equal(response.status, 400, path);
+      assert.equal((await response.json() as { error: { code: string } }).error.code, 'VALIDATION_ERROR');
+    }
+  } finally { await runtime.close(); }
+
+  const noHistoryMethod = { async listPending() { return []; }, async adjudicate() { throw new Error('not used'); } } as Adapter;
+  const noMethod = await withServer(noHistoryMethod);
+  try {
+    const response = await fetch(`${noMethod.url}/acct-1/request-1/history`, { headers: auth });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: { code: 'IDEMPOTENCY_UNAVAILABLE', message: 'Adjudication history is unavailable', retryable: false }, automaticRetry: false });
+  } finally { await noMethod.runtime.close(); }
+
+  const broken: Adapter = { async listPending() { return []; }, async adjudicate() { throw new Error('not used'); }, async listAdjudications() { throw new Error('sensitive database error'); } };
+  const failing = await withServer(broken);
+  try {
+    const response = await fetch(`${failing.url}/acct-1/request-1/history`, { headers: auth });
+    assert.equal(response.status, 503);
+    const body = await response.text();
+    assert.deepEqual(JSON.parse(body), { error: { code: 'IDEMPOTENCY_UNAVAILABLE', message: 'Adjudication history could not be read', retryable: true }, automaticRetry: false });
+    assert.doesNotMatch(body, /sensitive/);
+  } finally { await failing.runtime.close(); }
+});
+
 test('adjudication requires explicit valid identifiers and outcome, and never sends', async () => {
   const calls: unknown[] = [];
-  const adapter: Adapter = { async listPending() { return []; }, async adjudicate(input) { calls.push(input); return { id: 'adj-1', outcome: input.outcome, accountId: input.accountId, requestId: input.requestId }; } };
+  const adapter: Adapter = { async listPending() { return []; }, async listAdjudications() { return []; }, async adjudicate(input) { calls.push(input); return { id: 'adj-1', outcome: input.outcome, accountId: input.accountId, requestId: input.requestId }; } };
   const { runtime, url } = await withServer(adapter);
   try {
     const path = `${url}/acct-1/request-1/adjudicate`;

@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import vm from 'node:vm';
 import { startServer } from '../src/server.js';
 
 const account = { id: 'main', alias: 'Main', self_id: '10001', provider: 'napcat', enabled: true, access_token: 'transport-secret', permission: 'direct' as const };
@@ -36,12 +37,47 @@ test('admin embedded script parses in async wrapper and retains qualification/id
   } finally { await rm(tempDir, { recursive: true, force: true }); }
 
   assert.match(script, /qualificationForm/);
+  assert.equal((script.match(/function bindAiAdvisoryRetentionPanel\(/g) ?? []).length, 1);
+  assert.doesNotMatch(script, /function initRetentionPanel\(/);
   assert.match(script, /qualificationChecks/);
   assert.match(script, /provider-qualification\/checklist/);
   assert.match(script, /qualificationStatus/);
   assert.ok(script.includes("/api/admin/idempotency/reconciliation"));
   assert.match(script, /function loadIdempotencyRecords\(/);
   assert.match(script, /async function adjudicateIdempotency\(/);
+});
+
+test('account-scoped idempotency adjudication POST encodes both path identifiers and sends the operator assertion', async () => {
+  const { adminPage } = await import('../src/admin-page.js');
+  const start = adminPage.indexOf('<script>') + '<script>'.length;
+  const end = adminPage.indexOf('</script>', start);
+  const script = adminPage.slice(start, end);
+  const fnStart = script.indexOf('async function adjudicateIdempotency(form){');
+  assert.notEqual(fnStart, -1, 'admin script must define the adjudication handler');
+  const fnEnd = script.indexOf('\n', fnStart);
+  const declaration = script.slice(fnStart, fnEnd === -1 ? undefined : fnEnd);
+  let request: { path: string; options: RequestInit } | undefined;
+  let refreshed = false;
+  let confirmed = '';
+  const context = vm.createContext({
+    api: async (path: string, options: RequestInit) => { request = { path, options }; },
+    confirm: (message: string) => { confirmed = message; return true; },
+    notify: () => {},
+    loadIdempotencyRecords: async () => { refreshed = true; },
+  });
+  vm.runInContext(`${declaration}\nthis.run = adjudicateIdempotency;`, context);
+  const form = {
+    dataset: { account: 'acct / one', idempotencyAdjudicate: 'req?#1' },
+    elements: { outcome: { value: 'not-sent' }, note: { value: '  checked provider log  ' } },
+    querySelector: () => ({ disabled: false }),
+  };
+  await (context.run as (form: typeof form) => Promise<void>)(form);
+  assert.match(confirmed, /不会重发/);
+  assert.equal(request?.path, '/api/admin/idempotency/reconciliation/acct%20%2F%20one/req%3F%231/adjudicate');
+  assert.equal(request?.options.method, 'POST');
+  assert.deepEqual(JSON.parse(String(request?.options.body)), { outcome: 'not-sent', note: 'checked provider log' });
+  assert.equal((request?.options.headers as Record<string, string>)['content-type'], 'application/json');
+  assert.equal(refreshed, true);
 });
 
 test('admin audit endpoint rejects unauthenticated, invalid pagination, and reports unavailable persistent storage',async()=>{
@@ -97,9 +133,12 @@ test('serves a local admin UI without embedding secrets or external assets', asy
     assert.ok(html.includes("$('contactAccount').addEventListener('change',()=>{void refreshContactLists();$('contactSearchResults').innerHTML='<div class=\"hint\">输入搜索内容</div>'})"));
     assert.ok(html.includes('loadContacts(previousContactAccount);'));
     assert.ok(html.includes("encodeURIComponent(id)}/contacts`"));
-    assert.match(html, /sync-friends/);
-    assert.match(html, /sync-groups/);
-    assert.match(html, /sync-members/);
+    assert.match(html, /id="syncFriends" data-contact-sync="friends"/);
+    assert.match(html, /id="syncGroups" data-contact-sync="groups"/);
+    assert.match(html, /id="syncMembers" data-contact-sync="members"/);
+    assert.match(html, /id="contactAccount" required aria-label="选择要同步联系人的账号"/);
+    assert.match(html, /id="contactGroup" data-contact-group aria-label="选择群组以同步成员"/);
+    assert.match(html, /api\/admin\/accounts\/\$\{encodeURIComponent\(id\)\}\/contacts\/\$\{suffix\}/);
     assert.match(html, /contactDirectory/);
     assert.match(html, /contact-directory-scroll/);
     assert.match(html, /data-contact-kind="member"/);

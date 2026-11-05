@@ -34,6 +34,7 @@ import {PostgresContactsStore,type ContactsStore, type ContactsSnapshot} from '.
 import { PostgresNotificationQueue } from './notification-queue.js';
 import { PostgresMessageNotificationOutbox } from './message-notification-outbox.js';
 import { NotificationWorker } from './notification-worker.js';
+import { deliverNotificationOnce } from './notification-dispatch.js';
 import { NotificationDigestWorker } from './notification-digest-worker.js';
 import type { NotificationDigest } from './notification-digest.js';
 import { applyInboxRules, type InboxRule } from './inbox-rules.js';
@@ -41,6 +42,8 @@ import { MemoryInboxRulesStore, PostgresInboxRulesStore, type InboxRulesStore } 
 import { createAttachmentRouteHandler } from './attachments/routes.js';
 import { createOneBotFileRetriever } from './attachments/provider-adapter.js';
 import { PostgresHistoryReconciliationAudit } from './history-reconciliation-audit.js';
+import { createHistoryReconciliationHttpHandler, HISTORY_RECONCILIATION_HTTP_PATH } from './history-reconciliation-http.js';
+import { createHistoryReconciliationService, type HistoryReconciliationRequest } from './history-reconciliation-service.js';
 import { getProviderCapabilities } from './provider-capabilities.js';
 import { PROVIDER_QUALIFICATION_CHECKLIST } from './provider-qualification.js';
 import { ProviderQualificationStore } from './provider-qualification-store.js';
@@ -48,7 +51,18 @@ import { PostgresProviderQualificationStore } from './provider-qualification-pg-
 import { uploadAndSendAttachment } from './attachments/upload-send-workflow.js';
 import { resolveAllowedFile } from './attachments/sandbox.js';
 import { classifyIncomingMessage, type ClassificationIngressOptions } from './ai-classification-ingress.js';
-import type { MessageClassifier, Classification } from './ai-classification.js';
+import type { MessageClassifier } from './ai-classification.js';
+import { persistIncomingAiAdvisory, type AiAdvisoryRuntimePolicy } from './ai-advisory-runtime.js';
+import { PostgresAiAdvisoryStore } from './ai-advisory-store.js';
+import { PostgresAiAdvisoryConsentStore } from './ai-advisory-consent-store.js';
+import { createAiAdvisoryConsentService, type AiAdvisoryConsentState } from './ai-advisory-consent.js';
+import { withAiAdvisoryConsent } from './ai-advisory-consent-gate.js';
+import { registerAiAdvisoriesTool } from './mcp-ai-advisories.js';
+import { previewAiAdvisoryRetention, applyAiAdvisoryRetention, type RetentionPreview } from './ai-advisory-retention.js';
+import { PostgresAiAdvisoryRetentionRepository } from './ai-advisory-retention-adapter.js';
+import { executeAiAdvisoryRetentionBatch, type AiAdvisoryRetentionTransactionRunner } from './ai-advisory-retention-transaction.js';
+import type { AiAdvisoryRetentionRepository } from './ai-advisory-retention.js';
+import { validateAiAdvisoryRetentionPolicy, type ValidatedAiAdvisoryRetentionPolicy } from './ai-advisory-retention-policy.js';
 
 export type Peer = { account: AccountConfig; socket: WebSocket; connectedAt: number; pending: Map<string, (value: unknown) => void> };
 class MemoryContactsStore implements ContactsStore{private snapshots=new Map<string,ContactsSnapshot>();async get(id:string){return structuredClone(this.snapshots.get(id)??{friends:[],groups:[],members:[],last_synced:{friends:null,groups:null,members:{}}});}async search(accountId:string,query:string,limit=50){const snapshot=await this.get(accountId);const contacts:import('./contact-resolver.js').Contact[]=[...snapshot.friends.map(f=>({account_id:accountId,qq_id:String(f.user_id),...(f.nickname!==undefined?{nickname:f.nickname}:{}),...(f.remark!==undefined?{remark:f.remark}:{})})),...snapshot.members.flatMap(g=>g.members.map(m=>({account_id:accountId,qq_id:String(m.user_id),...(m.nickname!==undefined?{nickname:m.nickname}:{}),...(m.card!==undefined?{card:m.card}:{}),group_id:g.group_id})))];const result=resolveContact(contacts,accountId,query);return{...result,results:result.candidates.slice(0,Math.min(100,Math.max(1,limit)))};}async replaceFriends(id:string,rows:readonly import('./contacts-cache.js').Friend[],syncedAt=new Date()){const s=await this.get(id);s.friends=[...rows];s.last_synced.friends=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroups(id:string,rows:readonly import('./contacts-cache.js').Group[],syncedAt=new Date()){const s=await this.get(id);s.groups=[...rows];s.last_synced.groups=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroupMembers(id:string,groupId:string|number,rows:readonly import('./contacts-cache.js').GroupMember[],syncedAt=new Date()){const s=await this.get(id);s.members=s.members.filter(x=>x.group_id!==String(groupId));s.members.push({group_id:String(groupId),members:[...rows]});s.last_synced.members[String(groupId)]=syncedAt.toISOString();this.snapshots.set(id,s);}}
@@ -68,6 +82,9 @@ async function readBody(req: IncomingMessage, max: number): Promise<unknown> {
 }
 function respond(res: ServerResponse, code: number, body: unknown): void {
   res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(body));
+}
+function respondMetrics(res: ServerResponse, body: string): void {
+  res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' }); res.end(body);
 }
 function safeTokenEqual(a:string,b:string):boolean{const l=createHmac('sha256','aoi').update(a).digest(),r=createHmac('sha256','aoi').update(b).digest();return timingSafeEqual(l,r);}
 export async function enqueueNotificationSafely(enqueue:()=>Promise<unknown>, log:Pick<Logger,'warn'>, context:{account_id:string;message_id:string}):Promise<boolean>{try{await enqueue();return true;}catch(error){log.warn({...context,error:error instanceof Error?error.message:'unknown'},'notification queue enqueue failed');return false;}}
@@ -89,9 +106,68 @@ export function startNotificationReconciliation(outbox: Pick<PostgresMessageNoti
 
 function accountById(config:AppConfig,id:string):AccountConfig|undefined{return config.accounts.find(a=>a.id===id&&a.enabled);}
 function accountsById(config:AppConfig,id:string):AccountConfig|undefined{return config.accounts.find(account=>account.id===id);}
-export async function dispatchNotification(store:NotificationConfigStore,message:NormalizedMessage,account:AccountConfig|undefined,deliveryStore?:Pick<PostgresNotificationDeliveryStore,'record'>):Promise<boolean>{
+const NOTIFICATION_CONTEXT_BEFORE = 10;
+const NOTIFICATION_CONTEXT_AFTER = 2;
+const NOTIFICATION_CONTEXT_MAX_CHARS = 1200;
+const NOTIFICATION_CONTEXT_LINE_CHARS = 200;
+
+export type NotificationContextSource = {
+  context(id: string, before?: number, after?: number): NormalizedMessage[] | Promise<NormalizedMessage[]>;
+};
+
+function formatContextClock(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '--:--';
+  const pad = (input: number): string => String(input).padStart(2, '0');
+  return `${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+}
+
+/**
+ * Render a bounded transcript around one message so a reminder carries enough
+ * surrounding dialogue to judge what is being asked, without shipping an
+ * unbounded conversation to the webhook. Never throws: a missing history store
+ * or a failed range query degrades to "no context".
+ */
+export async function buildNotificationContext(
+  source: NotificationContextSource | undefined,
+  message: NormalizedMessage,
+): Promise<string> {
+  if (!source) return '';
+  let window: NormalizedMessage[];
+  try {
+    window = await source.context(message.id, NOTIFICATION_CONTEXT_BEFORE, NOTIFICATION_CONTEXT_AFTER);
+  } catch {
+    return '';
+  }
+  if (!Array.isArray(window) || window.length === 0) return '';
+  const lines: string[] = [];
+  for (const item of window) {
+    const who = item.direction === 'outgoing' ? '本号' : (item.sender_name || item.sender_id || '未知');
+    const text = (item.plain_text || '[非文本消息]').replace(/\s+/g, ' ').slice(0, NOTIFICATION_CONTEXT_LINE_CHARS);
+    const marker = item.id === message.id ? '▸ ' : '  ';
+    lines.push(`${marker}${formatContextClock(item.sent_at)} ${who}: ${text}`);
+  }
+  const joined = lines.join('\n');
+  return joined.length > NOTIFICATION_CONTEXT_MAX_CHARS
+    ? joined.slice(joined.length - NOTIFICATION_CONTEXT_MAX_CHARS)
+    : joined;
+}
+
+export async function dispatchNotification(store:NotificationConfigStore,message:NormalizedMessage,account:AccountConfig|undefined,deliveryStore?:Pick<PostgresNotificationDeliveryStore,'record'>,contextSource?:NotificationContextSource):Promise<boolean>{
   let history:NotificationDelivery|undefined;
-  let succeeded=true;try{const settings=await store.get();if(!settings.enabled||!settings.webhookUrl||!settings.webhookSecret||!account)return true;const levels=['P0','P1','P2','P3','P4'];if(levels.indexOf(message.priority)>levels.indexOf(settings.minPriority))return true;const preview=settings.includePreview?message.plain_text.slice(0,240):'';const notifier=new HermesWebhookNotifier({url:settings.webhookUrl,secret:settings.webhookSecret,timeoutMs:settings.timeoutMs});const event:AgentNotification={event:'message.received',account:account.alias,message_id:message.id,priority:message.priority,sender:message.sender_name??message.sender_id,conversation:message.conversation_id,preview,reason:'Inbound message priority threshold matched'};history={event:'message.received',accountId:account.id,messageId:message.id,outcome:'failure'};let last:unknown;for(let attempt=0;attempt<settings.maxAttempts;attempt++){try{await notifier.notify(event);history.outcome='success';history.httpStatus=200;return true;}catch(error){last=error;const status=error instanceof Error?/returned HTTP ([1-5]\d{2})/.exec(error.message)?.[1]:undefined;if(status)history.httpStatus=Number(status);}}succeeded=false;throw last instanceof Error?last:new Error('Webhook failed');}catch(error){logger.warn({error:error instanceof Error?error.message:'unknown'},'notification delivery failed');return succeeded;}finally{if(history&&deliveryStore)try{await deliveryStore.record(history);}catch{logger.warn({},'notification history persistence failed');}}
+  try{
+    const settings=await store.get();
+    if(!settings.enabled||!settings.webhookUrl||!settings.webhookSecret||!account)return true;
+    const levels=['P0','P1','P2','P3','P4'];
+    if(levels.indexOf(message.priority)>levels.indexOf(settings.minPriority))return true;
+    const preview=settings.includePreview?message.plain_text.slice(0,240):'';
+    const context=settings.includeContext?await buildNotificationContext(contextSource,message):'';
+    const notifier=new HermesWebhookNotifier({url:settings.webhookUrl,secret:settings.webhookSecret,timeoutMs:settings.timeoutMs});
+    const event:AgentNotification={event:'message.received',account:account.alias,message_id:message.id,priority:message.priority,sender:message.sender_name??message.sender_id,conversation:message.conversation_id,preview,reason:'Inbound message priority threshold matched',...(context?{context}:{})};
+    history={event:'message.received',accountId:account.id,messageId:message.id,outcome:'failure'};
+    try{await deliverNotificationOnce(()=>notifier.notify(event));history.outcome='success';history.httpStatus=200;return true;}
+    catch(error){const status=error instanceof Error?/(?:returned HTTP|HTTP) ([1-5]\d{2})/.exec(error.message)?.[1]:undefined;if(status)history.httpStatus=Number(status);history.outcome='failure';logger.warn({error:error instanceof Error?error.message:'unknown'},'notification delivery failed');throw error;}
+  }finally{if(history&&deliveryStore)try{await deliveryStore.record(history);}catch{logger.warn({},'notification history persistence failed');}}
 }
 
 type RuleRequest = { id?: unknown; kind?: unknown; weight?: unknown; priority?: unknown; keywords?: unknown; accountIds?: unknown; conversationTypes?: unknown; groupIds?: unknown; senderIds?: unknown; atMe?: unknown };
@@ -153,7 +229,7 @@ function validateAttachmentActionUrlHosts(accounts: readonly AccountConfig[], ra
     if (!attachmentActionUrlHostAllowed(account, raw)) throw new Error(`Account ${account.id} action_url host must be included in ATTACHMENT_ACTION_URL_ALLOWED_HOSTS`);
   }
 }
-export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string; accountStore?: Pick<AccountStore, 'loadConfiguredAccounts'|'create'>; inboxRules?: readonly InboxRule[]; notificationDigest?: { enabled: boolean; intervalMs?: number; batchSize?: number }; aiClassification?: { enabled: true; policy: ClassificationIngressOptions; classifier: MessageClassifier }; idempotencyReconciliation?: Pick<PostgresIdempotencyReconciliationStorage, 'listPending' | 'adjudicate'> } = {}): Promise<Runtime> {
+export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string; accountStore?: Pick<AccountStore, 'loadConfiguredAccounts'|'create'>; inboxRules?: readonly InboxRule[]; notificationDigest?: { enabled: boolean; intervalMs?: number; batchSize?: number }; aiClassification?: { enabled: true; policy: ClassificationIngressOptions; classifier: MessageClassifier }; aiAdvisories?: { enabled: true; accountIds: readonly string[]; model: string; policyVersion: string; policy: ClassificationIngressOptions; classifier: MessageClassifier; store?: Pick<PostgresAiAdvisoryStore, 'record' | 'list'>; consent?: Pick<import('./ai-advisory-consent.js').AiAdvisoryConsentService, 'query'>; }; aiAdvisoryRetention?: unknown; testAiAdvisoryRetentionRepository?: AiAdvisoryRetentionRepository; testAiAdvisoryRetentionTransaction?: AiAdvisoryRetentionTransactionRunner; historyReconciliation?: { service: (request: HistoryReconciliationRequest) => Promise<unknown>; maxBodyBytes?: number }; idempotencyReconciliation?: Pick<PostgresIdempotencyReconciliationStorage, 'listPending' | 'adjudicate' | 'listAdjudications'>; testAiAdvisoryDependencies?: true } = {}): Promise<Runtime> {
   if(options.requireDatabase&&!options.databaseUrl)throw new Error('DATABASE_URL is required for durable runtime');
   const attachmentMaxBytes = parseAttachmentMaxBytes(process.env.ATTACHMENT_MAX_BYTES);
   validateAttachmentActionUrlHosts(config.accounts, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS);
@@ -190,6 +266,29 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
     }catch(error){await pool.end();throw error;}
   }
   store=runtimeStore;
+  const aiAdvisoryStore = options.aiAdvisories?.enabled ? options.aiAdvisories.store ?? (pool ? new PostgresAiAdvisoryStore(pool) : undefined) : undefined;
+  const aiAdvisoryRecorder = options.aiAdvisories?.enabled ? options.aiAdvisories.store && 'record' in options.aiAdvisories.store ? options.aiAdvisories.store : pool ? new PostgresAiAdvisoryStore(pool) : undefined : undefined;
+  const aiAdvisoryConsent = options.aiAdvisories?.enabled ? options.aiAdvisories.consent ?? (pool ? createAiAdvisoryConsentService(new PostgresAiAdvisoryConsentStore({ query: <T = Record<string, unknown>>(text: string, values?: unknown[]) => pool!.query(text, values).then(result => ({ rows: result.rows as T[] })) })) : undefined) : undefined;
+  const retentionPolicy: ValidatedAiAdvisoryRetentionPolicy | undefined = options.aiAdvisoryRetention === undefined ? undefined : validateAiAdvisoryRetentionPolicy(options.aiAdvisoryRetention);
+  if (retentionPolicy && !pool && (!options.testAiAdvisoryDependencies || !options.testAiAdvisoryRetentionRepository || !options.testAiAdvisoryRetentionTransaction)) throw new Error('AI advisory retention requires durable PostgreSQL');
+  const retentionRepository = retentionPolicy ? options.testAiAdvisoryRetentionRepository ?? (pool ? new PostgresAiAdvisoryRetentionRepository(pool) : undefined) : undefined;
+  const retentionTransaction = options.testAiAdvisoryRetentionTransaction;
+  const retentionConfirmations = new Map<string, { preview: RetentionPreview; expiresAt: number }>();
+  const retentionConfirmationTtlMs = 15 * 60 * 1000;
+  const retentionConfirmationMaxEntries = 1000;
+  const pruneRetentionConfirmations = (now = Date.now()): void => {
+    for (const [token, entry] of retentionConfirmations) {
+      if (entry.expiresAt <= now) retentionConfirmations.delete(token);
+    }
+    while (retentionConfirmations.size >= retentionConfirmationMaxEntries) {
+      const oldest = retentionConfirmations.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      retentionConfirmations.delete(oldest);
+    }
+  };
+
+  if (options.aiAdvisories?.enabled && !options.aiAdvisories.accountIds.every(id => config.accounts.some(account => account.id === id && account.enabled))) throw new Error('AI advisory accountIds must match enabled configured accounts');
+  if (options.aiAdvisories?.enabled && (!aiAdvisoryStore || !aiAdvisoryRecorder || !aiAdvisoryConsent || (!pool && options.testAiAdvisoryDependencies !== true))) throw new Error('AI advisory processing requires durable PostgreSQL message, consent, and advisory stores');
   const notificationDeliveryStore=pool?new PostgresNotificationDeliveryStore(pool):undefined;
   const qualificationStore = pool ? new PostgresProviderQualificationStore(pool) : new ProviderQualificationStore();
   const notificationQueue=pool?new PostgresNotificationQueue(pool):undefined;
@@ -214,24 +313,40 @@ const peers = new Map<string, Peer>();
   const contactsCache=new ContactsCache();
   const contactsStore:ContactsStore=contactSearch;
   const contactSync=new ContactSyncService(onebot,contactsCache,contactsStore,options.accountEncryptionKey??config.apiToken);
-  const pendingContactRefreshes = new Map<string, Promise<void>>();
+  const pendingContactRefreshes = new Map<string, { dirty: boolean }>();
   const scheduleContactRefresh = (account: AccountConfig, event: OneBotEvent): void => {
     for (const request of mapContactChangeEvent(event)) {
       const key = `${account.id}:${request.kind}:${request.kind === 'members' ? request.group_id : ''}`;
-      if (pendingContactRefreshes.has(key)) continue;
-      const refresh = Promise.resolve().then(async () => {
-        if (request.kind === 'friends') await contactSync.syncFriends(account);
-        else if (request.kind === 'groups') await contactSync.syncGroups(account);
-        else await contactSync.syncMembers(account, request.group_id);
-      }).catch(error => logger.warn({ account_id: account.id, kind: request.kind, error: error instanceof Error ? error.message : 'unknown' }, 'contact refresh after notice failed')).finally(() => {
-        if (pendingContactRefreshes.get(key) === refresh) pendingContactRefreshes.delete(key);
-      });
-      pendingContactRefreshes.set(key, refresh);
+      const active = pendingContactRefreshes.get(key);
+      if (active) { active.dirty = true; continue; }
+      const state = { dirty: false };
+      pendingContactRefreshes.set(key, state);
+      const refresh = async (): Promise<void> => {
+        do {
+          state.dirty = false;
+          try {
+            if (request.kind === 'friends') await contactSync.syncFriends(account);
+            else if (request.kind === 'groups') await contactSync.syncGroups(account);
+            else await contactSync.syncMembers(account, request.group_id);
+          } catch (error) {
+            logger.warn({ account_id: account.id, kind: request.kind, error: error instanceof Error ? error.message : 'unknown' }, 'contact refresh after notice failed');
+          }
+        } while (state.dirty);
+        if (pendingContactRefreshes.get(key) === state) pendingContactRefreshes.delete(key);
+      };
       // Refresh work is coalesced per account/list and never awaited by ingress.
-      void refresh;
+      void refresh();
     }
   };
   const attachmentHandler=createAttachmentRouteHandler({apiToken:config.apiToken,allowedRoots:(process.env.ATTACHMENT_ALLOWED_ROOTS??'').split(path.delimiter).filter(Boolean),maxBytes:attachmentMaxBytes,resolveAccount:accountId=>{const account=accountById(config,accountId);return account&&attachmentActionUrlHostAllowed(account,process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS)?{permission:account.permission,retrieve:createOneBotFileRetriever(onebot,account)}:undefined;}});
+  const historyReconciliationHandler = createHistoryReconciliationHttpHandler({
+    isAuthorized: req => safeTokenEqual(config.apiToken, bearer(req)),
+    resolveAccount: id => accountById(config, id),
+    ...(options.historyReconciliation?.maxBodyBytes !== undefined ? { maxBodyBytes: options.historyReconciliation.maxBodyBytes } : {}),
+    service: options.historyReconciliation?.service ?? (auditStore
+      ? createHistoryReconciliationService({ historyApi: onebot, store, audit: auditStore })
+      : async () => { throw new Error('History reconciliation requires persistent audit'); }),
+  });
   const digestConfig=options.notificationDigest;
   if(digestConfig?.enabled&&(!pool||!notificationQueue))throw new Error('Notification digest requires durable database configuration');
   const digestIntervalMs=digestConfig?.intervalMs??30_000;
@@ -248,7 +363,8 @@ const peers = new Map<string, Peer>();
     for(const id of digest.messageIds){const message=await store.get(id);if(!message||message.account_id!==digest.accountId)return false;const levels=['P0','P1','P2','P3','P4'];if(levels.indexOf(message.priority)<=levels.indexOf(settings.minPriority))eligible.push(message);}
     if(!eligible.length)return true;
     const notifier=new HermesWebhookNotifier({url:settings.webhookUrl,secret:settings.webhookSecret,timeoutMs:settings.timeoutMs});
-    const event:AgentNotification={event:'message.digest',account:account.alias,message_id:null,priority:eligible.reduce((best,message)=>['P0','P1','P2','P3','P4'].indexOf(message.priority)<['P0','P1','P2','P3','P4'].indexOf(best)?message.priority:best,eligible[0]!.priority),sender:'',conversation:'',preview:'',reason:`${eligible.length} new messages`};
+    const digestPreview=settings.includePreview?eligible.slice(0,20).map(message=>`[${message.priority}] ${message.sender_name??message.sender_id}: ${message.plain_text.replace(/\s+/g,' ').slice(0,120)}`).join('\n').slice(0,1200):'';
+    const event:AgentNotification={event:'message.digest',account:account.alias,message_id:null,priority:eligible.reduce((best,message)=>['P0','P1','P2','P3','P4'].indexOf(message.priority)<['P0','P1','P2','P3','P4'].indexOf(best)?message.priority:best,eligible[0]!.priority),sender:'',conversation:'',preview:digestPreview,reason:`${eligible.length} new messages`};
     try{for(let attempt=0;attempt<settings.maxAttempts;attempt++){try{await notifier.notify(event);return true;}catch{}}return false;}finally{if(notificationDeliveryStore)for(const message of eligible)try{await notificationDeliveryStore.record({event:'message.digest',accountId:account.id,messageId:message.id,outcome:'success',httpStatus:200});}catch{}}
   },digestBatchSize):undefined;
   const notificationWorker=!digestConfig?.enabled&&notificationQueue?new NotificationWorker(notificationQueue,async item=>{
@@ -256,7 +372,7 @@ const peers = new Map<string, Peer>();
     const [message]=await Promise.all([store.get(item.messageId)]);
     const account=accountsById(config,item.accountId);
     if(!message||!account)return false;
-    return await dispatchNotification(notificationStore,message,account,notificationDeliveryStore);
+    return await dispatchNotification(notificationStore,message,account,notificationDeliveryStore,store);
   }):undefined;
   notificationWorker?.start();
   let digestTimer:ReturnType<typeof setInterval>|undefined;
@@ -270,6 +386,62 @@ const peers = new Map<string, Peer>();
   const appHandler = async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     try {
+      if (url.pathname === '/api/admin/ai-advisory-retention/preview' || url.pathname === '/api/admin/ai-advisory-retention/apply') {
+        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!retentionPolicy || !retentionRepository || !options.aiAdvisories?.enabled) return respond(res, 503, { error: { code: 'RETENTION_UNAVAILABLE', message: 'Advisory retention is not enabled', retryable: false } });
+        let body: Record<string, unknown>;
+        try { const raw = await readBody(req, Math.min(config.maxMessageBytes, 16384)); if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(); body = raw as Record<string, unknown>; }
+        catch { return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid retention request', retryable: false } }); }
+        if (url.pathname.endsWith('/preview') && req.method === 'POST') {
+          if (Object.keys(body).some(key => !['accountId'].includes(key))) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Only accountId is accepted', retryable: false } });
+          const accountId = body.accountId;
+          if (typeof accountId !== 'string' || !options.aiAdvisories.accountIds.includes(accountId) || !accountById(config, accountId)?.enabled) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown or unauthorized account', retryable: false } });
+          try {
+            pruneRetentionConfirmations();
+            const preview = await previewAiAdvisoryRetention(retentionRepository, accountId, { retentionDays: retentionPolicy.retentionDays, limit: retentionPolicy.batchSize });
+            pruneRetentionConfirmations();
+            retentionConfirmations.set(preview.confirmationToken, { preview, expiresAt: Date.now() + retentionConfirmationTtlMs });
+            if (auditStore) await auditStore.record({ actor: 'admin', action: 'ai_advisory.retention.preview', account_id: accountId, target_type: 'ai_advisory', target_id: accountId, result: 'success', metadata: { cutoff: preview.cutoff, retention_days: retentionPolicy.retentionDays, limit: retentionPolicy.batchSize, candidates: preview.candidates.length, has_more: preview.hasMore } });
+            return respond(res, 200, { ...preview, confirmation_token: preview.confirmationToken, confirmationToken: undefined });
+          } catch { return respond(res, 503, { error: { code: 'RETENTION_UNAVAILABLE', message: 'Retention preview unavailable', retryable: true } }); }
+        }
+        if (url.pathname.endsWith('/apply') && req.method === 'POST') {
+          if (Object.keys(body).some(key => !['accountId', 'confirmation_token'].includes(key)) || typeof body.accountId !== 'string' || typeof body.confirmation_token !== 'string') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid confirmation request', retryable: false } });
+          const accountId = body.accountId;
+          if (!options.aiAdvisories.accountIds.includes(accountId) || !accountById(config, accountId)?.enabled) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown or unauthorized account', retryable: false } });
+          pruneRetentionConfirmations();
+          const confirmation = retentionConfirmations.get(body.confirmation_token);
+          if (!confirmation || confirmation.expiresAt <= Date.now() || confirmation.preview.accountId !== accountId) {
+            retentionConfirmations.delete(body.confirmation_token);
+            return respond(res, 400, { error: { code: 'INVALID_CONFIRMATION', message: 'Invalid or expired confirmation', retryable: false } });
+          }
+          const preview = confirmation.preview;
+          // Claim synchronously before any awaited apply work so concurrent requests cannot replay it.
+          retentionConfirmations.delete(body.confirmation_token);
+          try {
+            const result = await applyAiAdvisoryRetention({
+              listExpired: input => retentionRepository.listExpired(input),
+              deleteAdvisories: input => executeAiAdvisoryRetentionBatch(retentionTransaction ?? {
+                transaction: async work => {
+                  const client = await pool!.connect();
+                  try {
+                    await client.query('BEGIN');
+                    const value = await work({ deleteAdvisories: batch => new PostgresAiAdvisoryRetentionRepository(client).deleteAdvisories(batch) });
+                    await client.query('COMMIT');
+                    return value;
+                  } catch (error) { await client.query('ROLLBACK'); throw error; }
+                  finally { client.release(); }
+                },
+              }, input),
+            }, preview);
+            if (auditStore) await auditStore.record({ actor: 'admin', action: 'ai_advisory.retention.apply', account_id: accountId, target_type: 'ai_advisory', target_id: accountId, result: 'success', metadata: { requested: result.requested, deleted: result.deleted, retention_days: retentionPolicy.retentionDays, cutoff: preview.cutoff } });
+            return respond(res, 200, { requested: result.requested, deleted: result.deleted, accountId });
+          } catch { if (auditStore) await auditStore.record({ actor: 'admin', action: 'ai_advisory.retention.apply', account_id: accountId, target_type: 'ai_advisory', target_id: accountId, result: 'failure', metadata: { error: 'retention_apply_failed' } }).catch(() => {}); return respond(res, 503, { error: { code: 'RETENTION_UNAVAILABLE', message: 'Retention apply unavailable', retryable: true } }); }
+        }
+        return respond(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Unsupported retention operation', retryable: false } });
+      }
+      if (HISTORY_RECONCILIATION_HTTP_PATH.test(url.pathname)) return await historyReconciliationHandler(req, res);
+
       if(req.method==='GET'&&url.pathname.startsWith('/api/attachments/')){if(await attachmentHandler(req,res))return;}
       if (req.method === 'GET' && (url.pathname === (config.adminBasePath ?? '/admin') || url.pathname === `${config.adminBasePath ?? '/admin'}/`)) {
         const html = adminPage;
@@ -282,7 +454,7 @@ const peers = new Map<string, Peer>();
         const connected = [...peers.values()].filter(p => p.socket.readyState === WebSocket.OPEN).length;
         return respond(res, 200, { status: 'ready', database: pool ? 'connected' : 'not_configured', redis: 'not_configured', connected_transports: connected });
       }
-      if (req.method === 'GET' && url.pathname === '/metrics') return respond(res, 200, `message_ingest_total ${eventCount}\nduplicate_event_total ${duplicateCount}\nsend_success_total ${sendSuccess}\nsend_failure_total ${sendFailure}\nconnected_transports ${[...peers.values()].filter(p => p.socket.readyState === WebSocket.OPEN).length}\n`);
+      if (req.method === 'GET' && url.pathname === '/metrics') return respondMetrics(res, `message_ingest_total ${eventCount}\nduplicate_event_total ${duplicateCount}\nsend_success_total ${sendSuccess}\nsend_failure_total ${sendFailure}\nconnected_transports ${[...peers.values()].filter(p => p.socket.readyState === WebSocket.OPEN).length}\n`);
       const eventsMatch = url.pathname.match(/^\/onebot\/v11\/events\/([^/]+)$/);
       if (req.method === 'POST' && eventsMatch) {
         const account = accountById(config, decodeURIComponent(eventsMatch[1]!));
@@ -295,11 +467,47 @@ const peers = new Map<string, Peer>();
         const normalized = normalizeEvent(account.id, account.provider, `http:${account.id}`, event);
         const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
         if (!message) return respond(res, 200, { status: 'ignored' });
-        const advisory = await classifyIncomingMessage(message, options.aiClassification?.policy, options.aiClassification?.classifier);
-        if (advisory) (message as NormalizedMessage & { ai_advisory?: { account_id: string; classification: Classification } }).ai_advisory = { account_id: account.id, classification: advisory };
-        const result=await store.insert(message); if(result.inserted)await applyRulesToStoredMessage(result.message); eventCount++; if(!result.inserted)duplicateCount++;else if(auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
+        const result = await store.insert(message);
+        if (result.inserted) {
+        try {
+            await classifyIncomingMessage(message, options.aiClassification?.policy, options.aiClassification?.classifier);
+          } catch (error) {
+            logger.warn({ account_id: account.id, message_id: message.id, error: error instanceof Error ? error.message : 'unknown' }, 'AI classification failed; continuing message ingestion');
+          }
+          if (options.aiAdvisories?.enabled && options.aiAdvisories.accountIds.includes(account.id)) {
+            const advisory = options.aiAdvisories;
+            try {
+              await withAiAdvisoryConsent(account.id, aiAdvisoryConsent!, async expectedRevision => {
+                const result = await classifyIncomingMessage(message, advisory.policy, advisory.classifier);
+                return result ? { ...result } : undefined;
+              }, async (classified, expectedRevision) => {
+                await aiAdvisoryRecorder!.record({ accountId: account.id, messageId: message.id, label: classified.label, confidence: classified.confidence, model: advisory.model, policyVersion: advisory.policyVersion, expectedConsentRevision: expectedRevision });
+              });
+            } catch (error) {
+              logger.warn({ account_id: account.id, message_id: message.id, error: error instanceof Error ? error.message : 'unknown' }, 'AI advisory failed; continuing message ingestion');
+            }
+          }
+          await applyRulesToStoredMessage(result.message);
+        }
+        eventCount++; if(!result.inserted)duplicateCount++;else if(auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
             if(pool)await enqueueNotificationSafely(()=>notificationQueue!.enqueue({event:'message.received',accountId:account.id,messageId:result.message.id,dedupeKey:`message.received:${account.id}:${result.message.id}`}),logger,{account_id:account.id,message_id:result.message.id});
         return respond(res, 200, { status: result.inserted ? 'stored' : 'duplicate', message_id: result.message.id });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/ai-advisories') {
+        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!aiAdvisoryStore || !options.aiAdvisories?.enabled) return respond(res, 503, { error: { code: 'AI_ADVISORIES_UNAVAILABLE', message: 'AI advisory persistence is not enabled', retryable: false } });
+        const accountId = url.searchParams.get('account_id');
+        if (!accountId || !options.aiAdvisories?.enabled || !options.aiAdvisories.accountIds.includes(accountId)) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown or unauthorized account', retryable: false } });
+        const limitRaw = url.searchParams.get('limit');
+        const limit = limitRaw === null ? 50 : Number(limitRaw);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) return respond(res, 400, { error: { code: 'INVALID_PAGINATION', message: 'limit must be between 1 and 100', retryable: false } });
+        const before = url.searchParams.get('before');
+        const beforeMessageId = url.searchParams.get('before_message_id');
+        if ((before === null) !== (beforeMessageId === null) || (before !== null && !Number.isFinite(Date.parse(before))) || (beforeMessageId !== null && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(beforeMessageId))) return respond(res, 400, { error: { code: 'INVALID_CURSOR', message: 'Both before and a valid before_message_id are required', retryable: false } });
+        let advisories;
+        try { advisories = await aiAdvisoryStore.list(accountId, { limit, ...(before === null ? {} : { before, beforeMessageId: beforeMessageId! }) }); }
+        catch { return respond(res, 503, { error: { code: 'AI_ADVISORIES_UNAVAILABLE', message: 'AI advisories unavailable', retryable: true } }); }
+        return respond(res, 200, { advisories, next_cursor: advisories.length === limit ? `${advisories[advisories.length - 1]!.createdAt}|${advisories[advisories.length - 1]!.messageId}` : null });
       }
       if (req.method === 'GET' && url.pathname === '/api/accounts') {
         if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
@@ -312,6 +520,32 @@ const peers = new Map<string, Peer>();
         const result = await store.query(params);
         const messages = await Promise.all(result.messages.map(async message => ({ ...message, state: await store.state(message.id) })));
         return respond(res, 200, { ...result, messages });
+      }
+      const contextRoute = url.pathname.match(/^\/api\/messages\/([^/]+)\/context$/);
+      if (req.method === 'GET' && contextRoute) {
+        if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        const messageId = decodeURIComponent(contextRoute[1] ?? '');
+        const anchor = await store.get(messageId);
+        if (!anchor) return respond(res, 404, { error: { code: 'NOT_FOUND', message: 'Message not found', retryable: false } });
+        const bound = (name: string, fallback: number): number => {
+          const raw = url.searchParams.get(name);
+          if (raw === null) return fallback;
+          const parsed = Number(raw);
+          if (!Number.isInteger(parsed) || parsed < 0 || parsed > 100) throw new Error(`Invalid ${name}`);
+          return parsed;
+        };
+        let before = 10, after = 2;
+        try { before = bound('before', 10); after = bound('after', 2); }
+        catch (error) { return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: error instanceof Error ? error.message : 'Invalid context window', retryable: false } }); }
+        const window = await store.context(messageId, before, after);
+        return respond(res, 200, {
+          message_id: messageId,
+          account_id: anchor.account_id,
+          conversation_id: anchor.conversation_id,
+          before,
+          after,
+          messages: window,
+        });
       }
       const adminAccounts=url.pathname.match(/^\/api\/admin\/accounts(?:\/([^/]+))?$/);
       if(adminAccounts){
@@ -379,6 +613,15 @@ const peers = new Map<string, Peer>();
           if (!/^[A-Za-z0-9_-]{1,200}$/.test(accountId) || !Number.isInteger(limit) || limit < 1 || limit > 100) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Valid accountId and limit from 1 to 100 are required', retryable: false } });
           try { return respond(res, 200, { records: (await reconciliation.listPending(accountId, limit)).map(({ accountId: id, requestId, messageType, targetId, state, createdAt, updatedAt }) => ({ accountId: id, requestId, messageType, targetId, state, createdAt, updatedAt })), automaticRetry: false }); }
           catch { return respond(res, 503, { error: { code: 'IDEMPOTENCY_UNAVAILABLE', message: 'Idempotency reconciliation could not read the database', retryable: true }, automaticRetry: false }); }
+        }
+        const historyMatch = url.pathname.match(/^\/api\/admin\/idempotency\/reconciliation\/([^/]+)\/([^/]+)\/history$/);
+        if (req.method === 'GET' && historyMatch) {
+          let accountId: string; let requestId: string;
+          try { accountId = decodeURIComponent(historyMatch[1]!); requestId = decodeURIComponent(historyMatch[2]!); } catch { return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid accountId or requestId', retryable: false } }); }
+          if (!/^[A-Za-z0-9_-]{1,200}$/.test(accountId) || !/^[A-Za-z0-9._:-]{1,500}$/.test(requestId)) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid accountId or requestId', retryable: false } });
+          if (!reconciliation.listAdjudications) return respond(res, 503, { error: { code: 'IDEMPOTENCY_UNAVAILABLE', message: 'Adjudication history is unavailable', retryable: false }, automaticRetry: false });
+          try { return respond(res, 200, { adjudications: (await reconciliation.listAdjudications(accountId, requestId)).map(({ id, accountId: idAccount, requestId: idRequest, outcome, note, actor, createdAt }) => ({ id, accountId: idAccount, requestId: idRequest, outcome, note, actor, createdAt })) }); }
+          catch { return respond(res, 503, { error: { code: 'IDEMPOTENCY_UNAVAILABLE', message: 'Adjudication history could not be read', retryable: true }, automaticRetry: false }); }
         }
         const match = url.pathname.match(/^\/api\/admin\/idempotency\/reconciliation\/([^/]+)\/([^/]+)\/adjudicate$/);
         if (req.method === 'POST' && match) {
@@ -454,7 +697,7 @@ const peers = new Map<string, Peer>();
         } catch (error) { return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: error instanceof Error ? error.message : 'Invalid inbox rules', retryable: false } }); }
       }
       if (req.method === 'GET' && url.pathname === '/api/admin/notifications') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});const value=await notificationStore.get();return respond(res,200,{settings:{...value,webhookSecret:undefined,webhookSecretConfigured:Boolean(value.webhookSecret)}}); }
-      if (req.method === 'PUT' && url.pathname === '/api/admin/notifications') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be object');const input=body as Record<string,unknown>,previous=await notificationStore.get();const enabled=input.enabled===undefined?previous.enabled:input.enabled;const webhookUrl=input.webhookUrl===undefined?previous.webhookUrl:input.webhookUrl;const webhookSecret=input.webhookSecret===undefined?'':input.webhookSecret;const minPriority=input.minPriority??previous.minPriority;const includePreview=input.includePreview===undefined?previous.includePreview:input.includePreview;const timeoutMs=input.timeoutMs??previous.timeoutMs,maxAttempts=input.maxAttempts??previous.maxAttempts;if(typeof enabled!=='boolean'||typeof webhookUrl!=='string'||webhookUrl.length>2048||typeof webhookSecret!=='string'||webhookSecret.length>4096||typeof includePreview!=='boolean'||!['P0','P1','P2','P3','P4'].includes(String(minPriority))||typeof timeoutMs!=='number'||!Number.isInteger(timeoutMs)||timeoutMs<500||timeoutMs>60000||typeof maxAttempts!=='number'||!Number.isInteger(maxAttempts)||maxAttempts<1||maxAttempts>10)throw new Error('Invalid notification settings');if(webhookUrl&&new URL(webhookUrl).protocol!=='https:')throw new Error('Webhook URL must use HTTPS');await notificationStore.put({enabled,webhookUrl,webhookSecret:webhookSecret||previous.webhookSecret,minPriority:minPriority as 'P0'|'P1'|'P2'|'P3'|'P4',includePreview,timeoutMs,maxAttempts});if(auditStore)await auditStore.record({actor:'admin',action:'notification.settings.update',target_type:'notification',target_id:'webhook',result:'success',metadata:{enabled,minPriority,includePreview,timeoutMs,maxAttempts,secretConfigured:Boolean(webhookSecret||previous.webhookSecret)}});const saved=await notificationStore.get();return respond(res,200,{settings:{...saved,webhookSecret:undefined,webhookSecretConfigured:Boolean(saved.webhookSecret)}});}catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid settings',retryable:false}});} }
+      if (req.method === 'PUT' && url.pathname === '/api/admin/notifications') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});try{const body=await readBody(req,config.maxMessageBytes);if(!body||typeof body!=='object'||Array.isArray(body))throw new Error('Body must be object');const input=body as Record<string,unknown>,previous=await notificationStore.get();const enabled=input.enabled===undefined?previous.enabled:input.enabled;const webhookUrl=input.webhookUrl===undefined?previous.webhookUrl:input.webhookUrl;const webhookSecret=input.webhookSecret===undefined?'':input.webhookSecret;const minPriority=input.minPriority??previous.minPriority;const includePreview=input.includePreview===undefined?previous.includePreview:input.includePreview;const includeContext=input.includeContext===undefined?previous.includeContext:input.includeContext;const timeoutMs=input.timeoutMs??previous.timeoutMs,maxAttempts=input.maxAttempts??previous.maxAttempts;if(typeof enabled!=='boolean'||typeof webhookUrl!=='string'||webhookUrl.length>2048||typeof webhookSecret!=='string'||webhookSecret.length>4096||typeof includePreview!=='boolean'||typeof includeContext!=='boolean'||!['P0','P1','P2','P3','P4'].includes(String(minPriority))||typeof timeoutMs!=='number'||!Number.isInteger(timeoutMs)||timeoutMs<500||timeoutMs>60000||typeof maxAttempts!=='number'||!Number.isInteger(maxAttempts)||maxAttempts<1||maxAttempts>10)throw new Error('Invalid notification settings');if(webhookUrl&&new URL(webhookUrl).protocol!=='https:')throw new Error('Webhook URL must use HTTPS');await notificationStore.put({enabled,webhookUrl,webhookSecret:webhookSecret||previous.webhookSecret,minPriority:minPriority as 'P0'|'P1'|'P2'|'P3'|'P4',includePreview,includeContext,timeoutMs,maxAttempts});if(auditStore)await auditStore.record({actor:'admin',action:'notification.settings.update',target_type:'notification',target_id:'webhook',result:'success',metadata:{enabled,minPriority,includePreview,includeContext,timeoutMs,maxAttempts,secretConfigured:Boolean(webhookSecret||previous.webhookSecret)}});const saved=await notificationStore.get();return respond(res,200,{settings:{...saved,webhookSecret:undefined,webhookSecretConfigured:Boolean(saved.webhookSecret)}});}catch(error){return respond(res,400,{error:{code:'VALIDATION_ERROR',message:error instanceof Error?error.message:'Invalid settings',retryable:false}});} }
       if (req.method === 'POST' && url.pathname === '/api/admin/notifications/test') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});const value=await notificationStore.get();if(!value.enabled||!value.webhookUrl||!value.webhookSecret)return respond(res,409,{error:{code:'NOTIFICATION_CONFIG_INCOMPLETE',message:'Enable notifications and configure URL/secret',retryable:false}});try{await new HermesWebhookNotifier({url:value.webhookUrl,secret:value.webhookSecret,timeoutMs:value.timeoutMs}).notify({event:'test',account:'admin-console',message_id:null,priority:value.minPriority,sender:'',conversation:'',preview:'',reason:'Admin notification test'});if(auditStore)await auditStore.record({actor:'admin',action:'notification.test',target_type:'notification',target_id:'webhook',result:'success'});return respond(res,200,{sent:true});}catch(error){if(auditStore)await auditStore.record({actor:'admin',action:'notification.test',target_type:'notification',target_id:'webhook',result:'failure',metadata:{error:error instanceof Error?error.message:'Delivery failed'}});return respond(res,502,{error:{code:'NOTIFICATION_TEST_FAILED',message:error instanceof Error?error.message:'Delivery failed',retryable:false}});} }
       const contactPath = url.pathname.match(/^\/api\/admin\/accounts\/([^/]+)\/contacts(?:\/(friends|groups|members|search|sync-friends|sync-groups|sync-members))?$/);
       if (contactPath) {
@@ -670,6 +913,8 @@ const peers = new Map<string, Peer>();
     }
   };
   const wss = new WebSocketServer({ noServer: true, maxPayload: config.maxMessageBytes });
+  // Main HTTP MCP has bearer authentication but no caller-to-account entitlement binding.
+  // Do not expose advisory data here until the authenticated principal can be scoped to accounts.
   const mcp = createMcpService(config, store, contactsStore, { allowedRoots: (process.env.ATTACHMENT_ALLOWED_ROOTS??'').split(path.delimiter).filter(Boolean), maxBytes: attachmentMaxBytes, resolveAccount: accountId => { const account = accountById(config, accountId); return account && attachmentActionUrlHostAllowed(account, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS) ? { permission: account.permission, retrieve: createOneBotFileRetriever(onebot, account) } : undefined; } });
   server.removeAllListeners('request');
   server.on('request', (req, res) => {
@@ -719,10 +964,29 @@ const peers = new Map<string, Peer>();
       const normalized = normalizeEvent(account.id, account.provider, `reverse-ws:${account.id}`, event);
       const message = normalized ? applyPriority(normalized, activePriorityConfig) : null;
       if (!message) return;
-      const advisory = await classifyIncomingMessage(message, options.aiClassification?.policy, options.aiClassification?.classifier);
-      if (advisory) (message as NormalizedMessage & { ai_advisory?: { account_id: string; classification: Classification } }).ai_advisory = { account_id: account.id, classification: advisory };
-      const result = await store.insert(message); eventCount++; if (!result.inserted) duplicateCount++;
-      if (result.inserted) await applyRulesToStoredMessage(result.message);
+      const result = await store.insert(message);
+      if (result.inserted) {
+        try {
+          await classifyIncomingMessage(message, options.aiClassification?.policy, options.aiClassification?.classifier);
+        } catch (error) {
+          logger.warn({ account_id: account.id, message_id: message.id, error: error instanceof Error ? error.message : 'unknown' }, 'AI classification failed; continuing message ingestion');
+        }
+        if (options.aiAdvisories?.enabled && options.aiAdvisories.accountIds.includes(account.id)) {
+          const advisory = options.aiAdvisories;
+          try {
+            await withAiAdvisoryConsent(account.id, aiAdvisoryConsent!, async expectedRevision => {
+              const result = await classifyIncomingMessage(message, advisory.policy, advisory.classifier);
+              return result ? { ...result } : undefined;
+            }, async (classified, expectedRevision) => {
+              await aiAdvisoryRecorder!.record({ accountId: account.id, messageId: message.id, label: classified.label, confidence: classified.confidence, model: advisory.model, policyVersion: advisory.policyVersion, expectedConsentRevision: expectedRevision });
+            });
+          } catch (error) {
+            logger.warn({ account_id: account.id, message_id: message.id, error: error instanceof Error ? error.message : 'unknown' }, 'AI advisory failed; continuing message ingestion');
+          }
+        }
+        await applyRulesToStoredMessage(result.message);
+      }
+      eventCount++; if (!result.inserted) duplicateCount++;
       if(result.inserted&&auditStore)void auditStore.record({actor:'onebot',action:'message.ingest',account_id:account.id,message_id:result.message.id,target_type:'message',target_id:result.message.id,result:'success'}).catch(error=>logger.warn({account_id:account.id,error:error instanceof Error?error.message:'audit failed'},'message audit write failed'));
       if(pool)await enqueueNotificationSafely(()=>notificationQueue!.enqueue({event:'message.received',accountId:account.id,messageId:result.message.id,dedupeKey:`message.received:${account.id}:${result.message.id}`}),logger,{account_id:account.id,message_id:result.message.id});
     });

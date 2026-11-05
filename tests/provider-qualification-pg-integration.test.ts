@@ -6,27 +6,64 @@ import { test } from 'node:test';
 import pg from 'pg';
 import { PostgresProviderQualificationStore } from '../src/provider-qualification-pg-store.js';
 
-const databaseUrl = process.env.TEST_DATABASE_URL;
-const databaseName = (() => {
-  if (!databaseUrl) return '';
-  try {
-    const parsed = new URL(databaseUrl);
-    if (parsed.protocol !== 'postgres:' && parsed.protocol !== 'postgresql:') return '';
-    return decodeURIComponent(parsed.pathname.slice(1));
-  } catch {
-    return '';
-  }
-})();
-// The test refuses to connect unless the explicitly supplied database name is
-// clearly disposable. The schema name below is generated locally and validated
-// before it is ever interpolated as an SQL identifier.
-const optInIsSafe = Boolean(databaseUrl && databaseName && /(?:^|[-_])(test|tests|testing|ci|tmp|temp)(?:$|[-_])/i.test(databaseName));
+const isLoopbackHost = (hostname: string): boolean => {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  return host === 'localhost' || host === '::1' || host === '127.0.0.1' || host.startsWith('127.');
+};
 
-test('qualification migration and store work against an isolated PostgreSQL schema', { skip: !optInIsSafe && (databaseUrl ? 'TEST_DATABASE_URL database name must clearly identify a test/temporary database' : 'set TEST_DATABASE_URL to opt in') }, async () => {
+const safetyReason = (value?: string, allowRemote = false): string | undefined => {
+  if (!value) return 'set TEST_DATABASE_URL to opt in';
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'postgres:' && parsed.protocol !== 'postgresql:') return 'TEST_DATABASE_URL must use PostgreSQL';
+    const databaseName = decodeURIComponent(parsed.pathname.slice(1));
+    if (!databaseName || !/(?:^|[-_])(test|tests|testing|ci|tmp|temp)(?:$|[-_])/i.test(databaseName)) {
+      return 'TEST_DATABASE_URL database name must clearly identify a test/temporary database';
+    }
+    if (!allowRemote && !isLoopbackHost(parsed.hostname)) return 'remote PostgreSQL host refused (set ALLOW_REMOTE_TEST_DATABASE=true to explicitly allow)';
+    return undefined;
+  } catch {
+    return 'TEST_DATABASE_URL must be a valid PostgreSQL URL';
+  }
+};
+
+test('PostgreSQL integration safety guard refuses remote hosts by default', () => {
+  assert.match(safetyReason('postgres://user:secret@db.example.com/app_test') ?? '', /remote PostgreSQL host refused/);
+  assert.equal(safetyReason('postgres://user:***@localhost/app_test'), undefined);
+  assert.match(safetyReason('postgres://user:***@localhost./app_test') ?? '', /remote PostgreSQL host refused/);
+  assert.match(safetyReason('postgres://user:***@localhost.example.com/app_test') ?? '', /remote PostgreSQL host refused/);
+  assert.equal(safetyReason('postgres://user:***@127.0.0.2/app_test'), undefined);
+  assert.equal(safetyReason('postgres://user:***@[::1]/app_test'), undefined);
+  assert.match(safetyReason('postgres://user:***@[2001:db8::1]/app_test') ?? '', /remote PostgreSQL host refused/);
+});
+
+test('PostgreSQL integration safety guard validates database path literally', () => {
+  assert.equal(safetyReason('postgres://user:***@localhost/app_test_db'), undefined);
+  assert.match(safetyReason('postgres://user:***@localhost/app%2Ftest') ?? '', /database name/);
+  assert.match(safetyReason('postgres://user:***@localhost/app%2Etest') ?? '', /database name/);
+  assert.match(safetyReason('postgres://user:***@localhost/app%ZZ_test') ?? '', /valid PostgreSQL URL/);
+  assert.match(safetyReason('postgres://user:***@localhost/') ?? '', /database name/);
+});
+
+test('PostgreSQL integration safety guard allows remote hosts only with explicit opt-in', () => {
+  assert.equal(safetyReason('postgres://user:secret@db.example.com/app_test', true), undefined);
+  assert.match(safetyReason('postgres://user:secret@db.example.com/production') ?? '', /database name/);
+});
+
+test('PostgreSQL integration safety guard does not disclose connection URLs', () => {
+  const reason = safetyReason('postgres://user:secret@db.example.com/app_test');
+  assert.ok(reason);
+  assert.doesNotMatch(reason, /secret|db\.example\.com|postgres:/);
+});
+
+const databaseUrl = process.env.TEST_DATABASE_URL;
+const allowRemote = process.env.ALLOW_REMOTE_TEST_DATABASE === 'true';
+const skipReason = safetyReason(databaseUrl, allowRemote);
+
+test('qualification migration and store work against an isolated PostgreSQL schema', { skip: skipReason }, async () => {
   const url = databaseUrl!;
   const admin = new pg.Pool({ connectionString: url, max: 1 });
   const schema = `qualification_it_${randomUUID().replaceAll('-', '')}`;
-  // Keep identifier interpolation constrained to a locally generated, safe SQL identifier.
   assert.match(schema, /^qualification_it_[a-f0-9]{32}$/);
   let scoped: pg.Pool | undefined;
   let schemaCreated = false;

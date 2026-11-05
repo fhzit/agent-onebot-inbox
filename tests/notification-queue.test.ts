@@ -25,25 +25,59 @@ test('claim uses skip-locked expired lease recovery and bounds the lease', async
 
 test('complete and retry are fenced by the current lease token', async () => {
   const calls: Array<{ sql: string; values: unknown[] }> = [];
-  const store = new PostgresNotificationQueue({ async query(text: string, values: unknown[] = []) { calls.push({ sql: text, values }); return { rows: [{ id: '1' }] }; } });
+  const store = new PostgresNotificationQueue({ async query(text: string, values: unknown[] = []) {
+    calls.push({ sql: text, values });
+    return text.startsWith('SELECT')
+      ? { rows: [{ attempts: 2, max_attempts: 5 }] }
+      : { rows: [{ id: '1' }] };
+  } });
   assert.equal(await store.complete('1', 'fence'), true);
   assert.match(calls[0]!.sql, /lease_token=\$2/);
   assert.deepEqual(calls[0]!.values, ['1', 'fence']);
-  assert.equal(await store.retry('1', 'fence', 'https://host/?token=secret', new Date(123)) , true);
-  assert.match(calls[1]!.sql, /attempts >= max_attempts THEN 'failed'/);
-  assert.deepEqual(calls[1]!.values.slice(0, 3), ['1', 'fence', new Date(123)]);
-  assert.equal(calls[1]!.values[3], 'Notification delivery failed');
+  assert.equal(await store.retry('1', 'fence', 'https://host/?token=secret', new Date(123)), true);
+  assert.match(calls[2]!.sql, /\$3::timestamptz/);
+  assert.deepEqual(calls[2]!.values.slice(0, 2), ['1', 'fence']);
+  assert.ok(calls[2]!.values[2] instanceof Date);
+  assert.ok((calls[2]!.values[2] as Date).getTime() >= 123);
+  assert.equal(calls[2]!.values[3], 'Notification delivery failed');
 });
 
-test('retry exhaustion ignores a future runAfter and marks terminal run_after due immediately', async () => {
-  let sql = ''; let values: unknown[] = [];
-  const store = new PostgresNotificationQueue({ async query(text: string, params: unknown[] = []) { sql = text; values = params; return { rows: [{ id: '1' }] }; } });
+test('retry exhaustion ignores future runAfter and terminalizes exhausted attempts', async () => {
+  const calls: Array<{ sql: string; values: unknown[] }> = [];
+  const store = new PostgresNotificationQueue({ async query(text: string, values: unknown[] = []) {
+    calls.push({ sql: text, values });
+    return text.startsWith('SELECT')
+      ? { rows: [{ attempts: 5, max_attempts: 5 }] }
+      : { rows: [{ id: '1' }] };
+  } });
   const futureRunAfter = new Date('2099-01-01T00:00:00Z');
   assert.equal(await store.retry('1', 'fence', 'failure', futureRunAfter), true);
-  assert.match(sql, /attempts >= max_attempts THEN 'failed'/);
-  assert.match(sql, /WHEN attempts >= max_attempts THEN now\(\)/);
-  assert.doesNotMatch(sql, /status='failed'/);
-  assert.deepEqual(values.slice(0, 3), ['1', 'fence', futureRunAfter]);
+  assert.match(calls[0]!.sql, /lease_until > now\(\)/);
+  assert.match(calls[1]!.sql, /WHEN \$3::timestamptz IS NULL THEN 'failed'/);
+  assert.deepEqual(calls[1]!.values, ['1', 'fence', null, 'Notification delivery failed']);
+});
+test('retry uses attempt-indexed shared backoff and honors an explicit runAfter lower bound', async () => {
+  const calls: Array<{ sql: string; values: unknown[] }> = [];
+  const store = new PostgresNotificationQueue({ async query(text: string, values: unknown[] = []) {
+    calls.push({ sql: text, values });
+    return text.startsWith('SELECT')
+      ? { rows: [{ attempts: 3, max_attempts: 5 }] }
+      : { rows: [{ id: '1' }] };
+  } });
+  const runAfter = new Date(Date.now() + 60_000);
+  await store.retry('1', 'lease', 'HTTP 503', runAfter);
+  assert.ok(calls[1]!.values[2] instanceof Date);
+  assert.ok((calls[1]!.values[2] as Date).getTime() >= runAfter.getTime());
+  assert.equal(calls[1]!.values[3], 'HTTP 503');
+  const permanentCalls: Array<{ sql: string; values: unknown[] }> = [];
+  const permanent = new PostgresNotificationQueue({ async query(text: string, values: unknown[] = []) {
+    permanentCalls.push({ sql: text, values });
+    return text.startsWith('SELECT')
+      ? { rows: [{ attempts: 1, max_attempts: 5 }] }
+      : { rows: [{ id: '2' }] };
+  } });
+  await permanent.retry('2', 'lease', 'HTTP 400');
+  assert.equal(permanentCalls[1]!.values[2], null);
 });
 test('claim marks expired final-attempt leases failed and clears their lease fields', async () => {
   let sql = '';
@@ -55,10 +89,12 @@ test('claim marks expired final-attempt leases failed and clears their lease fie
   assert.match(sql, /lease_token=NULL/);
   assert.match(sql, /lease_until=NULL/);
 });
-
 test('complete and retry require an unexpired lease to fence late workers', async () => {
   const statements: string[] = [];
-  const store = new PostgresNotificationQueue({ async query(text: string) { statements.push(text); return { rows: [{ id: '1' }] }; } });
+  const store = new PostgresNotificationQueue({ async query(text: string) {
+    statements.push(text);
+    return text.startsWith('SELECT') ? { rows: [{ attempts: 1, max_attempts: 5 }] } : { rows: [{ id: '1' }] };
+  } });
   await store.complete('1', 'token');
   await store.retry('1', 'token');
   assert.match(statements[0]!, /lease_until > now\(\)/);

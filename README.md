@@ -89,6 +89,8 @@ curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:8080/api/accounts
 
 MCP：
 
+`npm run mcp` and `npm run mcp:http` launch the stdio and Streamable HTTP transports, respectively, but the MCP data-tool inventory is intentionally disabled on both. Shared bearer authentication/stdio process identity does not establish a verified caller-to-account principal; tools will remain unavailable until that authorization boundary is implemented. Do not treat transport startup as usable MCP tools.
+
 ```bash
 npm run mcp       # stdio transport
 npm run mcp:http  # Streamable HTTP 服务
@@ -112,7 +114,7 @@ CLI `unread` 会请求 API 的 `unread=true` 过滤；该标记是 Agent inbox �
 - In the admin UI, open **设置 → 账号** and choose **添加账号**. Enter a unique internal ID, display name, your QQ `self_id`, provider (`napcat` or `snowluma`), and the OneBot access token. Keep permission at **readonly** until you intentionally enable sending. Enable the account only after its OneBot endpoint is reachable. For NapCat/SnowLuma, configure a Reverse WebSocket client targeting `wss://<your-inbox-host>/onebot/v11/ws/<account-id>` with the same access token; do not expose an unauthenticated OneBot endpoint publicly. Creating an account does not install or log in to QQ for you.
 - If managing outside the UI, use authenticated `POST /api/admin/accounts` with `{id,alias,self_id,provider,access_token,permission,enabled,action_url?}`; omit secrets from logs and shell history. PostgreSQL mode encrypts account tokens with `ACCOUNT_ENCRYPTION_KEY`; admin reads redact secret values.
 - Sensitive admin actions are written to the PostgreSQL audit table when configured; the read-only API is `GET /api/admin/audit`. Memory mode responds with `503 AUDIT_UNAVAILABLE`.
-- Notification settings support a Hermes Generic V2 webhook, priority threshold, optional message preview, timeout/retry bounds, and a test action. Secrets are encrypted with the runtime `ACCOUNT_ENCRYPTION_KEY`; PostgreSQL mode uses the runtime-wired durable queue/worker for inbound notifications. Live queue migration/recovery and provider delivery remain unverified.
+- Notification settings support a Hermes Generic V2 webhook, priority threshold, optional message preview, optional bounded conversation transcript (`includeContext`: up to 10 messages before and 2 after the trigger, 1200 characters), timeout/retry bounds, and a test action. Secrets are encrypted with the runtime `ACCOUNT_ENCRYPTION_KEY`; PostgreSQL mode uses the runtime-wired durable queue/worker for inbound notifications. Live queue migration/recovery and provider delivery remain unverified.
 - Account token values are write-only and never returned by management APIs; PostgreSQL mode encrypts them with AES-256-GCM using the externally supplied `ACCOUNT_ENCRYPTION_KEY` (base64-encoded 32 bytes). Keep this key in the protected runtime environment and back it up separately; losing it makes stored account tokens unrecoverable. Memory mode is volatile. The admin UI keeps its API token in tab memory only. In-memory settings disappear on process restart.
 - The admin page build parses inline JavaScript with Node during typecheck/build; tests extract the served HTML and verify script syntax.
 
@@ -121,10 +123,10 @@ CLI `unread` 会请求 API 的 `unread=true` 过滤；该标记是 Agent inbox �
 - Full NapCat/SnowLuma onboarding, provider capability compatibility, and automatic transport lifecycle/reconnect.
 - 联系人/群/成员同步与搜索 API 已接入，但 contact-aware 目标解析仍是未提交 helper，不是发送 runtime 行为。
 - Authenticated, optional OneBot HTTP event token validation is configurable via `ONEBOT_EVENT_TOKEN`; it is separate from the account transport token and is not enabled unless configured.
-- AI：分类入口当前仅为未提交 helper，未接入消息处理 runtime；摘要与任务提取也未实现。
+- AI advisory API/UI and opt-in retention preview/apply are current-worktree changes, not part of deployed commit `adcfe7a`; real PostgreSQL/provider/browser qualification remains open. Retention uses local one-time preview tokens and a generic `admin` audit actor, has no scheduler, and does not erase backups; it is not production-qualified. MCP data tools remain disabled on both stdio and HTTP pending verified caller-to-account authorization.
 - Live PostgreSQL validation of the runtime-wired notification queue/worker, retry/restart behavior and delivery outcomes; opt-in bounded per-account digest logic is implemented but live digest delivery is unqualified. No real provider/webhook end-to-end qualification.
 - Audit rows are written to PostgreSQL for sensitive admin actions; API exposure remains read-only. The application role cannot update/delete/truncate audit rows. This does not protect against database-owner tampering, and deployment currently uses a shared application DB role; an independently administered audit sink and retention policy are not implemented.
-- 附件上传、备份/恢复、用户角色和完整 MCP 操作覆盖仍未完成。基线 `8baa4a7` 已接入幂等附件发送 API；当前 worktree 的上传端点与恢复逻辑属于未提交代码，不代表已部署。
+- 备份/恢复、用户角色和 MCP data tools remain unavailable; worktree-only attachment/recovery changes must not be inferred as deployed from source presence.
 - Real QQ/provider end-to-end, security/load tests, and publicly reachable Cloudflare route validation.
 
 This is still Alpha, not a complete product or production-ready service.

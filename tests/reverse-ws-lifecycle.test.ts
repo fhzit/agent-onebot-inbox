@@ -61,3 +61,26 @@ test('stale attempt callbacks cannot replace a newer socket', () => {
   assert.equal(client.currentSocket, sockets[1]);
   client.close();
 });
+
+test('closes each transport exactly once when failure races with shutdown', () => {
+  const attempts: Array<{ connected: () => void; failed: () => void }> = [];
+  const sockets: Array<{ closed: number; close: () => void }> = [];
+  const jobs: Array<() => void> = [];
+  const client = createManagedReverseWsClient({
+    connect(events) {
+      attempts.push(events);
+      const socket = { closed: 0, close() { this.closed++; } };
+      sockets.push(socket);
+      return socket;
+    },
+    schedule(run) { jobs.push(run); return () => {}; },
+  });
+  client.start();
+  attempts[0]!.connected();
+  attempts[0]!.failed();
+  client.close();
+  assert.equal(sockets[0]!.closed, 1);
+  jobs[0]!();
+  attempts[0]!.failed();
+  assert.equal(sockets[0]!.closed, 1);
+});

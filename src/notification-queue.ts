@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { scheduleNotificationRetry } from './notification-retry-schedule.js';
 
 type QueryResult<T> = { rows: T[] };
 type Queryable = { query<T = Record<string, unknown>>(text: string, values?: unknown[]): Promise<QueryResult<T>> };
@@ -97,13 +98,24 @@ export class PostgresNotificationQueue {
   }
 
   async retry(id: string, leaseToken: string, error?: string | null, runAfter?: Date): Promise<boolean> {
+    const safeFailure = safeError(error);
+    const current = await this.db.query<{ attempts: number; max_attempts: number }>(
+      `SELECT attempts, max_attempts FROM notification_queue
+       WHERE id=$1 AND status='processing' AND lease_token=$2 AND lease_until > now()`,
+      [id, leaseToken],
+    );
+    const row = current.rows[0];
+    if (!row) return false;
+    const scheduledAt = scheduleNotificationRetry(row.attempts, safeFailure ?? 'delivery failed', {
+      maxAttempts: row.max_attempts,
+      ...(runAfter === undefined ? {} : { runAfter }),
+    });
     const result = await this.db.query<{ id: string }>(
-      `UPDATE notification_queue SET status=CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
-         run_after=CASE WHEN attempts >= max_attempts THEN now()
-           ELSE COALESCE($3, now()+LEAST(interval '1 hour', interval '5 seconds' * power(2, LEAST(attempts-1, 10)))) END,
+      `UPDATE notification_queue SET status=CASE WHEN $3::timestamptz IS NULL THEN 'failed' ELSE 'pending' END,
+         run_after=CASE WHEN $3::timestamptz IS NULL THEN now() ELSE $3 END,
          lease_token=NULL, lease_until=NULL, last_error=$4, updated_at=now()
        WHERE id=$1 AND status='processing' AND lease_token=$2 AND lease_until > now() RETURNING id`,
-      [id, leaseToken, runAfter ?? null, safeError(error)],
+      [id, leaseToken, scheduledAt, safeFailure],
     );
     return result.rows.length === 1;
   }

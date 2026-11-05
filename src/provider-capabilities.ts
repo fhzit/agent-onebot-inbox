@@ -10,6 +10,10 @@ const COMMON_V11_ACTIONS = [
   'send_private_msg', 'send_group_msg', 'delete_msg', 'get_msg',
   'get_login_info', 'get_stranger_info', 'get_friend_list', 'get_group_info', 'get_group_list',
   'get_group_member_info', 'get_group_member_list', 'get_file', 'get_status',
+] as const;
+
+const NAPCAT_V11_ACTIONS = [
+  ...COMMON_V11_ACTIONS,
   'upload_group_file', 'upload_private_file',
 ] as const;
 
@@ -21,7 +25,7 @@ const ACTION_ALIASES: Readonly<Record<string, readonly string[]>> = Object.freez
 });
 
 const REGISTRY: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  napcat: COMMON_V11_ACTIONS,
+  napcat: NAPCAT_V11_ACTIONS,
   snowluma: COMMON_V11_ACTIONS,
 });
 

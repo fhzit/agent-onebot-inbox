@@ -1,42 +1,79 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { z } from 'zod';
 import type { AppConfig } from './config.js';
 import type { MessageStore } from './store.js';
 import type { PostgresMessageStore } from './postgres-store.js';
 import type { ContactsStore } from './postgres-contacts-store.js';
-import { registerContactsSearchTool } from './mcp-contacts-search.js';
-import { registerContactsListTool } from './mcp-contacts-list.js';
-import { registerGroupMembersTool } from './mcp-group-members.js';
-import { registerConversationHistoryTool } from './mcp-history.js';
-import { registerTaskExtractionTool } from './mcp-task-extraction.js';
-import { retrieveAttachment, type ProviderFileRetriever } from './attachments/retrieval.js';
-import { registerAdditionalMcpTools, type AdditionalMcpHandlers } from './mcp-additional-tools.js';
+import type { PostgresAiAdvisoryStore } from './ai-advisory-store.js';
+import type { ProviderFileRetriever } from './attachments/retrieval.js';
+import type { AdditionalMcpHandlers } from './mcp-additional-tools.js';
 
-export type McpAttachmentService = { allowedRoots: readonly string[]; maxBytes: number; resolveAccount: (accountId: string) => { permission: string; retrieve: ProviderFileRetriever } | undefined | Promise<{ permission: string; retrieve: ProviderFileRetriever } | undefined> };
 
-export interface McpService { server: McpServer; connectStdio(): Promise<void>; createHttpTransport(): StreamableHTTPServerTransport; }
+export type McpAttachmentService = {
+  allowedRoots: readonly string[];
+  maxBytes: number;
+  resolveAccount: (accountId: string) =>
+    | { permission: string; retrieve: ProviderFileRetriever }
+    | undefined
+    | Promise<{ permission: string; retrieve: ProviderFileRetriever } | undefined>;
+};
 
-export function createMcpService(config: AppConfig, store: MessageStore | PostgresMessageStore, contactSearch?: Pick<ContactsStore, 'search' | 'get'>, attachments?: McpAttachmentService, adminHandlers?: AdditionalMcpHandlers): McpService {
+export interface McpService {
+  server: McpServer;
+  connectStdio(): Promise<void>;
+  createHttpTransport(): StreamableHTTPServerTransport;
+}
+
+/**
+ * Data tools are deliberately withheld until each transport can supply a
+ * verified, request-bound account principal. HTTP bearer authentication alone
+ * and a shared stdio process do not establish per-caller account entitlement.
+ */
+export function createMcpService(
+  _config: AppConfig,
+  _store: MessageStore | PostgresMessageStore,
+  _contactSearch?: Pick<ContactsStore, 'search' | 'get'>,
+  _attachments?: McpAttachmentService,
+  _adminHandlers?: AdditionalMcpHandlers,
+  _aiAdvisories?: { store: Pick<PostgresAiAdvisoryStore, 'list'>; allowedAccountIds: readonly string[] },
+): McpService {
   const server = new McpServer({ name: 'agent-onebot-inbox', version: '0.1.0' });
-  if(contactSearch){registerContactsSearchTool(server,contactSearch);registerContactsListTool(server,contactSearch);registerGroupMembersTool(server,contactSearch);}
-  if(adminHandlers) registerAdditionalMcpTools(server, adminHandlers);
-  registerConversationHistoryTool(server, store);
-  registerTaskExtractionTool(server, store);
-  server.registerTool('accounts_list', { description: 'List configured accounts and their enabled/permission status.', inputSchema: {} }, async () => ({ content: [{ type: 'text', text: JSON.stringify(config.accounts.map(({id, alias, self_id, provider, enabled, permission}) => ({id, alias, self_id, provider, enabled, permission}))) }] }));
-  if(attachments) server.registerTool('get_attachment', { description: 'Retrieve a provider attachment by explicit account and provider file ID. Requires a direct-permission account and returns only files within configured local roots.', inputSchema: { account_id: z.string().min(1), file_id: z.string().min(1) } }, async ({ account_id, file_id }) => { try { if(/[\\\\/]/.test(file_id)) throw new Error('Invalid provider file ID'); const account = await attachments.resolveAccount(account_id); if(!account) throw new Error('Unknown account'); if(account.permission !== 'direct') throw new Error('Direct attachment permission required'); const file = await retrieveAttachment(file_id, account.retrieve, attachments.allowedRoots, attachments.maxBytes); return { content: [{ type: 'text', text: JSON.stringify({ filename: file.filename, size: file.size, content_type: 'application/octet-stream', data_base64: file.bytes.toString('base64') }) }] }; } catch (error) { return { content: [{ type: 'text', text: error instanceof Error ? error.message : 'Attachment retrieval failed' }], isError: true }; } });
-  server.registerTool('message_attachments', { description: 'List attachment references from a stored message without fetching provider data. Use get_attachment with an explicit account and provider file ID to retrieve safely.', inputSchema: { message_id: z.string().min(1) } }, async ({ message_id }) => { const message = await store.get(message_id); if(!message) return { content:[{type:'text',text:'Message not found'}], isError:true }; const attachments = message.segments.flatMap(segment => { if(segment.type !== 'image' && segment.type !== 'record' && segment.type !== 'video' && segment.type !== 'file') return []; const data = segment.data as Record<string, unknown>; const raw = typeof data.file === 'string' ? data.file : ''; const filename = raw ? raw.split(/[\\/]/).filter(Boolean).at(-1) ?? '' : ''; return [{ type: segment.type, ...(filename ? { filename } : {}), ...(typeof data.file_id === 'string' ? { provider_file_id: data.file_id } : {}), ...(raw ? { remote_reference: raw } : {}) }]; }); return { content: [{ type: 'text', text: JSON.stringify(attachments) }] }; });
-  server.registerTool('inbox_list', { description: 'List recent stored messages with optional inbox filters and pagination.', inputSchema: { account_id: z.string().optional(), type: z.enum(['private','group']).optional(), sender: z.string().optional(), priority: z.enum(['P0','P1','P2','P3','P4']).optional(), at_me: z.boolean().optional(), state: z.enum(['unread','processed','dismissed']).optional(), keyword: z.string().optional(), since: z.string().optional(), until: z.string().optional(), offset: z.number().int().nonnegative().optional(), limit: z.number().int().min(1).max(200).optional() } }, async filters => ({ content: [{ type: 'text', text: JSON.stringify(await store.query(filters)) }] }));
-  server.registerTool('inbox_summary', { description: 'Summarize stored messages, optionally scoped by account and ISO timestamp.', inputSchema: { account_id: z.string().optional(), since: z.string().optional() } }, async ({ account_id, since }) => ({ content: [{ type: 'text', text: JSON.stringify(await store.summary(account_id, since)) }] }));
-  server.registerTool('message_get', { description: 'Fetch a stored message by its ID.', inputSchema: { id: z.string().min(1) } }, async ({ id }) => { const message = await store.get(id); return { content: [{ type: 'text', text: JSON.stringify(message ?? null) }], ...(message ? {} : { isError: true }) }; });
-  server.registerTool('inbox_search', { description: 'Search stored message text using filters and pagination.', inputSchema: { query: z.string().min(1), account_id: z.string().optional(), type: z.enum(['private','group']).optional(), sender: z.string().optional(), priority: z.enum(['P0','P1','P2','P3','P4']).optional(), at_me: z.boolean().optional(), state: z.enum(['unread','processed','dismissed']).optional(), since: z.string().optional(), until: z.string().optional(), offset: z.number().int().nonnegative().optional(), limit: z.number().int().min(1).max(200).optional() } }, async ({ query, ...filters }) => ({ content: [{ type: 'text', text: JSON.stringify(await store.query({ ...filters, keyword: query })) }] }));
-  server.registerTool('conversation_context', { description: 'Return messages before and after a target message in its conversation.', inputSchema: { message_id: z.string().min(1), before: z.number().int().min(0).max(100).optional(), after: z.number().int().min(0).max(100).optional() } }, async ({ message_id, before, after }) => ({ content: [{ type: 'text', text: JSON.stringify(await store.context(message_id, before, after)) }] }));
-  server.registerTool('inbox_state', { description: 'Read agent inbox state without changing QQ read status.', inputSchema: { message_id: z.string().min(1) } }, async ({ message_id }) => { const state = await store.state(message_id); return { content: [{ type: 'text', text: JSON.stringify(state ?? null) }], ...(state ? {} : { isError: true }) }; });
-  server.registerTool('mark_seen', { description: 'Mark a message seen by the agent without changing its processed status or QQ read status.', inputSchema: { message_id: z.string().min(1) } }, async ({ message_id }) => { const state = await store.markSeen(message_id); return { content: [{ type: 'text', text: JSON.stringify(state ?? null) }], ...(state ? {} : { isError: true }) }; });
-  server.registerTool('mark_seen_all', { description: 'Mark all currently unread messages seen by the agent; does not change processed status or QQ read status.', inputSchema: {} }, async () => ({ content: [{ type: 'text', text: JSON.stringify({ updated: await store.markAllSeen() }) }] }));
-  server.registerTool('mark_processed', { description: 'Mark a message seen by the agent and processed; never changes QQ read status.', inputSchema: { message_id: z.string().min(1) } }, async ({ message_id }) => { const state = await store.markProcessed(message_id); return { content: [{ type: 'text', text: JSON.stringify(state ?? null) }], ...(state ? {} : { isError: true }) }; });
-  server.registerTool('dismiss', { description: 'Dismiss a message from agent follow-up; never changes QQ read status.', inputSchema: { message_id: z.string().min(1) } }, async ({ message_id }) => { const state = await store.dismiss(message_id); return { content: [{ type: 'text', text: JSON.stringify(state ?? null) }], ...(state ? {} : { isError: true }) }; });
-  server.registerTool('service_status', { description: 'Report configured account and locally stored message counts.', inputSchema: {} }, async () => { const summary = await store.summary(); return { content: [{ type: 'text', text: JSON.stringify({ status: 'ok', accounts: config.accounts.length, enabled_accounts: config.accounts.filter(a => a.enabled).length, stored_messages: summary.count }) }] }; });
-  return { server, async connectStdio() { await server.connect(new StdioServerTransport()); }, createHttpTransport() { return new StreamableHTTPServerTransport() as unknown as import('@modelcontextprotocol/sdk/shared/transport.js').Transport & StreamableHTTPServerTransport; } };
+  server.registerTool('service_info', {
+    description: 'Return static service identity and version information.',
+    inputSchema: {},
+  }, async () => ({
+    content: [{ type: 'text', text: JSON.stringify({ service: 'agent-onebot-inbox', version: '0.1.0' }) }],
+  }));
+  server.registerTool('system_status', {
+    description: 'Return static MCP capability availability and service health without account or message data.',
+    inputSchema: {},
+  }, async () => ({
+    content: [{ type: 'text', text: JSON.stringify({
+      service: 'agent-onebot-inbox',
+      version: '0.1.0',
+      status: 'ok',
+      capabilities: {
+        account_data: false,
+        message_data: false,
+        contacts: false,
+        attachments: false,
+        administration: false,
+      },
+    }) }],
+  }));
+  // Explicit account IDs do not prove the connected caller's entitlement.
+  // Keep account-specific tools unavailable until request-bound scope exists.
+
+  // Account IDs from process environment are not caller authentication. Do not
+  // register data tools until a verified transport principal is available.
+  return {
+    server,
+    async connectStdio() {
+      await server.connect(new StdioServerTransport());
+    },
+    createHttpTransport() {
+      return new StreamableHTTPServerTransport() as unknown as import('@modelcontextprotocol/sdk/shared/transport.js').Transport & StreamableHTTPServerTransport;
+    },
+  };
 }

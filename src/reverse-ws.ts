@@ -37,6 +37,11 @@ export function createManagedReverseWsClient<T extends { close: () => void }>(op
   let socket: T | undefined;
   const connecting = new Set<T>();
   const disposed = new WeakSet<object>();
+  const closeOnce = (candidate: T) => {
+    if (disposed.has(candidate)) return;
+    disposed.add(candidate);
+    candidate.close();
+  };
   let closed = false;
   let generation = 0;
   const lifecycle = createProviderLifecycle({
@@ -48,11 +53,9 @@ export function createManagedReverseWsClient<T extends { close: () => void }>(op
       let candidate: T | undefined;
       const dispose = () => {
         if (!candidate) return;
-        if (disposed.has(candidate)) return;
-        disposed.add(candidate);
+        closeOnce(candidate);
         connecting.delete(candidate);
         if (socket === candidate) socket = undefined;
-        candidate.close();
       };
       try {
         candidate = options.connect({
@@ -63,8 +66,8 @@ export function createManagedReverseWsClient<T extends { close: () => void }>(op
             const prior = socket;
             socket = candidate;
             events.connected();
-            if (prior && prior !== candidate) prior.close();
-            for (const pending of connecting) pending.close();
+            if (prior && prior !== candidate) closeOnce(prior);
+            for (const pending of connecting) closeOnce(pending);
             connecting.clear();
           },
           failed() {
@@ -91,8 +94,8 @@ export function createManagedReverseWsClient<T extends { close: () => void }>(op
       lifecycle.close();
       const active = socket;
       socket = undefined;
-      active?.close();
-      for (const pending of connecting) pending.close();
+      if (active) closeOnce(active);
+      for (const pending of connecting) closeOnce(pending);
       connecting.clear();
     },
     get currentSocket() { return socket; },

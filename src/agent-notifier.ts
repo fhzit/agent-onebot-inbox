@@ -9,6 +9,8 @@ export type AgentNotification = {
   conversation: string;
   preview: string;
   reason: string;
+  /** Bounded transcript around the message. Only present when the operator enabled it. */
+  context?: string;
 };
 
 export type AgentNotifier = { notify(event: AgentNotification): Promise<void> };
@@ -42,6 +44,7 @@ export class HermesWebhookNotifier implements AgentNotifier {
       conversation: event.conversation,
       preview: event.preview,
       reason: event.reason,
+      ...(typeof event.context === 'string' && event.context ? { context: event.context } : {}),
     });
     const timestamp = String(Math.floor(Date.now() / 1000));
     const signature = createHmac('sha256', this.options.secret).update(`${timestamp}.${body}`).digest('hex');

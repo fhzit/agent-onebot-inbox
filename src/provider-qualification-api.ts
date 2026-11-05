@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { PROVIDER_QUALIFICATION_CHECKLIST } from './provider-qualification.js';
 import type { ProviderQualificationRecord, ProviderQualificationRecordInput, ProviderQualificationResultStore } from './provider-qualification-store.js';
+import { getQualificationLifecycleState } from './provider-qualification-lifecycle.js';
 
 export interface ProviderQualificationApiDependencies {
   /** Host-provided operator authentication/authorization; all routes are gated by it. */
@@ -19,8 +20,11 @@ export function registerProviderQualificationApi(app: FastifyInstance, deps: Pro
     { preHandler: deps.preHandler },
     async (request, reply) => {
       const { provider, version } = request.params;
-      const record = deps.store.get(provider, version);
-      return record ? reply.send({ record }) : reply.code(404).send({ error: 'Qualification record not found' });
+      const record = await deps.store.get(provider, version);
+      if (!record) return reply.code(404).send({ error: 'Qualification record not found' });
+      const requiredCheckIds = PROVIDER_QUALIFICATION_CHECKLIST[provider.trim().toLowerCase()]?.map(check => check.id) ?? [];
+      const lifecycle = getQualificationLifecycleState(record, requiredCheckIds);
+      return reply.send({ record, lifecycle, qualified: lifecycle === 'qualified' });
     },
   );
 
@@ -29,8 +33,10 @@ export function registerProviderQualificationApi(app: FastifyInstance, deps: Pro
     { preHandler: deps.preHandler },
     async (request, reply) => {
       try {
-        const record = deps.store.record(request.body);
-        return reply.code(201).send({ record });
+        const record = await deps.store.record(request.body);
+        const requiredCheckIds = PROVIDER_QUALIFICATION_CHECKLIST[record.provider]?.map(check => check.id) ?? [];
+        const lifecycle = getQualificationLifecycleState(record, requiredCheckIds);
+        return reply.code(201).send({ record, lifecycle, qualified: lifecycle === 'qualified' });
       } catch (error) {
         if (error instanceof TypeError) return reply.code(400).send({ error: error.message });
         request.log.error({ err: error }, 'Provider qualification write failed');

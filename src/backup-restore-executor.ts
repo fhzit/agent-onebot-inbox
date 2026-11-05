@@ -35,6 +35,7 @@ export async function executeBackupRestore(
   };
   if (options.apply !== true) return { mode: 'dry-run', preview, written: [] };
 
+  await assertNoSymlinkedAncestors(absoluteRoot);
   await mkdir(absoluteRoot, { recursive: true });
   await assertDirectoryNotSymlink(absoluteRoot);
   const destinations = new Set<string>();
@@ -88,6 +89,16 @@ async function assertSafeParentDirectories(root: string, rel: string): Promise<v
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
       throw error;
     }
+  }
+}
+
+async function assertNoSymlinkedAncestors(path: string): Promise<void> {
+  const parent = dirname(path);
+  if (parent !== path) await assertNoSymlinkedAncestors(parent);
+  try {
+    await assertDirectoryNotSymlink(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
 }
 
