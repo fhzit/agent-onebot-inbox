@@ -15,7 +15,7 @@ export class MemoryPriorityStore implements PriorityStore {
   async list(): Promise<PriorityConfig> {
     return {
       rules: [...this.rules.values()].filter(rule => (rule as PriorityRule & { enabled?: boolean }).enabled !== false),
-      watchPeople: [...this.people.values()].filter(person => person.enabled).map(({ userId, boost, accountIds }) => ({ userId, boost, ...(accountIds ? { accountIds } : {}) })),
+      watchPeople: [...this.people.values()].filter(person => person.enabled).map(({ id, userId, displayName, boost, accountIds }) => ({ id, userId, displayName, boost, ...(accountIds ? { accountIds } : {}) })),
     };
   }
   async putRule(rule: PriorityRule): Promise<void> { this.rules.set(rule.id, structuredClone(rule)); }
@@ -48,7 +48,7 @@ export class PostgresPriorityStore implements PriorityStore {
         };
       }),
       watchPeople: people.rows.filter(row => row.enabled && row.qq_id).map(row => ({
-        userId: row.qq_id!, boost: row.priority_boost,
+        id: row.id, userId: row.qq_id!, displayName: row.display_name, boost: row.priority_boost,
         ...(Array.isArray(jsonObject(row.account_scope).accountIds) ? { accountIds: jsonObject(row.account_scope).accountIds as string[] } : {}),
       })),
     };

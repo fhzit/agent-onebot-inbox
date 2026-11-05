@@ -12,7 +12,7 @@ export type PriorityRule = {
   keywords?: string[];
   atMe?: boolean;
 };
-export type WatchPerson = { userId: string; boost: number; accountIds?: string[] };
+export type WatchPerson = { userId: string; boost: number; accountIds?: string[]; id?: string; displayName?: string };
 export type PriorityInput = {
   accountId: string; conversationType: 'private' | 'group'; groupId?: string | null;
   senderId: string; text: string; atMe: boolean; atAll: boolean; baseScore?: number;

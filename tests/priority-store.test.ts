@@ -16,6 +16,6 @@ test('Postgres priority store round trips rules and watched contacts', async () 
  const store=new PostgresPriorityStore(pool as never);
  await store.putRule({id:'rule-1',keywords:['urgent'],weight:40,kind:'hard',priority:'P0',accountIds:['a']});
  await store.putWatchPerson({id:'person-1',userId:'123',displayName:'Alice',boost:25,enabled:true,accountIds:['a']});
- assert.deepEqual(await store.list(),{rules:[{id:'rule-1',keywords:['urgent'],weight:40,kind:'hard',priority:'P0',accountIds:['a'],conversationTypes:[],groupIds:[],senderIds:[]}],watchPeople:[{userId:'123',boost:25,accountIds:['a']}]});
+ assert.deepEqual(await store.list(),{rules:[{id:'rule-1',keywords:['urgent'],weight:40,kind:'hard',priority:'P0',accountIds:['a'],conversationTypes:[],groupIds:[],senderIds:[]}],watchPeople:[{id:'person-1',userId:'123',displayName:'Alice',boost:25,accountIds:['a']}]});
  assert.equal(await store.deleteRule('rule-1'),true);assert.equal(await store.deleteWatchPerson('person-1'),true);assert.deepEqual(await store.list(),{rules:[],watchPeople:[]});
 });
