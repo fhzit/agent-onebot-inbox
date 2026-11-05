@@ -41,12 +41,17 @@ export async function startStdioMcpServer(): Promise<void> {
     if (!encryptionKey) throw new Error('ACCOUNT_ENCRYPTION_KEY is required for persistent MCP stores');
     pool = new Pool({ connectionString: databaseUrl, max: 5, connectionTimeoutMillis: 5000 });
     const accountStore = new PostgresAccountStore(pool, encryptionKey);
-    service = createMcpService(config, PostgresMessageStore.fromPool(pool), undefined, undefined, createAdditionalMcpHandlers({
+    const contacts = new PostgresContactsStore(pool);
+    const messageStore = PostgresMessageStore.fromPool(pool);
+    const dataTools = process.env.MCP_DATA_TOOLS === '1'
+      ? { store: messageStore, allowedAccountIds: config.accounts.filter(account => account.enabled).map(account => account.id), contacts }
+      : undefined;
+    service = createMcpService(config, messageStore, undefined, undefined, createAdditionalMcpHandlers({
       accounts: accountStore,
-      contacts: new PostgresContactsStore(pool),
+      contacts,
       notifications: new PostgresNotificationConfigStore(pool, encryptionKey),
       deliveries: new PostgresNotificationDeliveryStore(pool),
-    }));
+    }), undefined, dataTools);
   } else {
     service = await createStdioMcpService(config);
   }

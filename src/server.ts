@@ -949,7 +949,14 @@ const peers = new Map<string, Peer>();
   const wss = new WebSocketServer({ noServer: true, maxPayload: config.maxMessageBytes });
   // Main HTTP MCP has bearer authentication but no caller-to-account entitlement binding.
   // Do not expose advisory data here until the authenticated principal can be scoped to accounts.
-  const mcp = createMcpService(config, store, contactsStore, { allowedRoots: (process.env.ATTACHMENT_ALLOWED_ROOTS??'').split(path.delimiter).filter(Boolean), maxBytes: attachmentMaxBytes, resolveAccount: accountId => { const account = accountById(config, accountId); return account && attachmentActionUrlHostAllowed(account, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS) ? { permission: account.permission, retrieve: createOneBotFileRetriever(onebot, account) } : undefined; } });
+  // Data tools stay off unless the operator opts in; the opt-in scopes every call to the
+  // accounts configured for this instance (single-operator deployment).
+  const mcpDataTools = process.env.MCP_DATA_TOOLS === '1'
+    ? { store, allowedAccountIds: config.accounts.filter(account => account.enabled).map(account => account.id), contacts: contactsStore }
+    : undefined;
+  if (process.env.MCP_DATA_TOOLS !== undefined && mcpDataTools === undefined) logger.warn('MCP_DATA_TOOLS is set but not "1"; inbox data tools remain disabled');
+  const mcp = createMcpService(config, store, contactsStore, { allowedRoots: (process.env.ATTACHMENT_ALLOWED_ROOTS??'').split(path.delimiter).filter(Boolean), maxBytes: attachmentMaxBytes, resolveAccount: accountId => { const account = accountById(config, accountId); return account && attachmentActionUrlHostAllowed(account, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS) ? { permission: account.permission, retrieve: createOneBotFileRetriever(onebot, account) } : undefined; } }, undefined, undefined, mcpDataTools);
+
   server.removeAllListeners('request');
   server.on('request', (req, res) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);

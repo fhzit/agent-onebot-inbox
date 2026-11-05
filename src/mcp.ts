@@ -8,6 +8,10 @@ import type { ContactsStore } from './postgres-contacts-store.js';
 import type { PostgresAiAdvisoryStore } from './ai-advisory-store.js';
 import type { ProviderFileRetriever } from './attachments/retrieval.js';
 import type { AdditionalMcpHandlers } from './mcp-additional-tools.js';
+import { registerInboxTools, type InboxMcpStore } from './mcp-inbox-tools.js';
+import { registerContactsListTool } from './mcp-contacts-list.js';
+import { registerContactsSearchTool } from './mcp-contacts-search.js';
+import { registerGroupMembersTool } from './mcp-group-members.js';
 
 
 export type McpAttachmentService = {
@@ -26,10 +30,17 @@ export interface McpService {
 }
 
 /**
- * Data tools are deliberately withheld until each transport can supply a
- * verified, request-bound account principal. HTTP bearer authentication alone
- * and a shared stdio process do not establish per-caller account entitlement.
+ * Data tools are withheld by default: the HTTP transport authenticates a shared
+ * bearer token, which proves service access but not a per-caller account
+ * entitlement. A single-operator deployment can opt in explicitly and scope the
+ * tools to the accounts it configures.
  */
+export type McpDataToolOptions = {
+  store: InboxMcpStore;
+  allowedAccountIds: readonly string[];
+  contacts?: Pick<ContactsStore, 'get' | 'search'>;
+};
+
 export function createMcpService(
   _config: AppConfig,
   _store: MessageStore | PostgresMessageStore,
@@ -37,6 +48,7 @@ export function createMcpService(
   _attachments?: McpAttachmentService,
   _adminHandlers?: AdditionalMcpHandlers,
   _aiAdvisories?: { store: Pick<PostgresAiAdvisoryStore, 'list'>; allowedAccountIds: readonly string[] },
+  dataTools?: McpDataToolOptions,
 ): McpService {
   const server = new McpServer({ name: 'agent-onebot-inbox', version: '0.1.0' });
   server.registerTool('service_info', {
@@ -63,7 +75,15 @@ export function createMcpService(
     }) }],
   }));
   // Explicit account IDs do not prove the connected caller's entitlement.
-  // Keep account-specific tools unavailable until request-bound scope exists.
+  // Opt-in data tools are scoped to the caller-configured account list instead.
+  if (dataTools) {
+    registerInboxTools(server, dataTools.store, dataTools.allowedAccountIds);
+    if (dataTools.contacts) {
+      registerContactsListTool(server, dataTools.contacts);
+      registerGroupMembersTool(server, dataTools.contacts);
+      registerContactsSearchTool(server, dataTools.contacts);
+    }
+  }
 
   // Account IDs from process environment are not caller authentication. Do not
   // register data tools until a verified transport principal is available.
