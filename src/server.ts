@@ -521,6 +521,40 @@ const peers = new Map<string, Peer>();
         const messages = await Promise.all(result.messages.map(async message => ({ ...message, state: await store.state(message.id) })));
         return respond(res, 200, { ...result, messages });
       }
+      if (req.method === 'GET' && url.pathname === '/api/conversations') {
+        if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        const accountId = url.searchParams.get('account_id') ?? undefined;
+        if (accountId && !accountById(config, accountId)) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown account', retryable: false } });
+        const typeParam = url.searchParams.get('type');
+        if (typeParam !== null && typeParam !== 'private' && typeParam !== 'group') return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid type', retryable: false } });
+        const bound = (name: string, fallback: number, max: number): number => {
+          const raw = url.searchParams.get(name);
+          if (raw === null) return fallback;
+          const parsed = Number(raw);
+          if (!Number.isInteger(parsed) || parsed < 0 || parsed > max) throw new Error(`Invalid ${name}`);
+          return parsed;
+        };
+        let offset = 0, conversationLimit = 50;
+        try { offset = bound('offset', 0, 1_000_000); conversationLimit = Math.max(1, bound('limit', 50, 200)); }
+        catch (error) { return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: error instanceof Error ? error.message : 'Invalid query', retryable: false } }); }
+        const result = await store.conversations({ ...(accountId ? { account_id: accountId } : {}), ...(typeParam ? { type: typeParam as 'private' | 'group' } : {}), offset, limit: conversationLimit });
+        return respond(res, 200, result);
+      }
+      const conversationThread = req.method === 'GET' ? url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/) : null;
+      if (conversationThread) {
+        if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        const conversationId = decodeURIComponent(conversationThread[1] ?? '');
+        if (!conversationId) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Conversation id is required', retryable: false } });
+        const accountId = url.searchParams.get('account_id') ?? undefined;
+        if (accountId && !accountById(config, accountId)) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown account', retryable: false } });
+        const before = url.searchParams.get('before') ?? undefined;
+        if (before !== undefined && Number.isNaN(new Date(before).getTime())) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid before cursor', retryable: false } });
+        const rawLimit = url.searchParams.get('limit');
+        const threadLimit = rawLimit === null ? 50 : Number(rawLimit);
+        if (!Number.isInteger(threadLimit) || threadLimit < 1 || threadLimit > 200) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Invalid limit', retryable: false } });
+        const thread = await store.conversationMessages(conversationId, { ...(accountId ? { account_id: accountId } : {}), ...(before ? { before } : {}), limit: threadLimit });
+        return respond(res, 200, thread);
+      }
       const contextRoute = url.pathname.match(/^\/api\/messages\/([^/]+)\/context$/);
       if (req.method === 'GET' && contextRoute) {
         if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });

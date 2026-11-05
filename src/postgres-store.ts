@@ -1,12 +1,14 @@
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import type { NormalizedMessage } from './normalize.js';
-import type { InboxQuery, InboxQueryResult, InboxState } from './store.js';
+import type { InboxQuery, InboxQueryResult, InboxState, ConversationQuery, ConversationQueryResult, ConversationMessageQuery, ConversationMessageResult } from './store.js';
 export interface SqlClient { query<R extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]): Promise<Pick<QueryResult<R>, 'rows'>>; }
 export interface RuntimeStore {
   insert(m: NormalizedMessage): Promise<{inserted:boolean;message:NormalizedMessage}> | {inserted:boolean;message:NormalizedMessage}; addOutgoing(m:NormalizedMessage):Promise<{inserted:boolean;message:NormalizedMessage}> | {inserted:boolean;message:NormalizedMessage};
   get(id:string):Promise<NormalizedMessage|undefined> | NormalizedMessage|undefined; list(accountId?:string,limit?:number):Promise<NormalizedMessage[]> | NormalizedMessage[];
   query(filters?:InboxQuery):Promise<InboxQueryResult> | InboxQueryResult; summary(accountId?:string,since?:string):Promise<{count:number;unread:number;high_priority:number;by_account:Record<string,number>;messages:NormalizedMessage[]}> | {count:number;unread:number;high_priority:number;by_account:Record<string,number>;messages:NormalizedMessage[]};
   context(id:string,before?:number,after?:number):Promise<NormalizedMessage[]> | NormalizedMessage[]; state(id:string):Promise<InboxState|undefined> | InboxState|undefined;
+  conversations(filters?:ConversationQuery):Promise<ConversationQueryResult> | ConversationQueryResult;
+  conversationMessages(conversationId:string,filters?:ConversationMessageQuery):Promise<ConversationMessageResult> | ConversationMessageResult;
   markSeen(id:string):Promise<InboxState|undefined> | InboxState|undefined; markAllSeen():Promise<number>|number; markProcessed(id:string):Promise<InboxState|undefined> | InboxState|undefined; dismiss(id:string):Promise<InboxState|undefined> | InboxState|undefined;
 }
 type DbMessage = Record<string, unknown> & {id:string;account_id:string};
@@ -37,5 +39,73 @@ export class PostgresMessageStore {
  async state(id:string):Promise<InboxState|undefined>{const r=await this.db.query<{direction:string;seen_by_agent:boolean|null;processed:boolean|null;dismissed:boolean|null}>('SELECT m.direction,s.seen_by_agent,s.processed,s.dismissed FROM messages m LEFT JOIN inbox_states s ON s.message_id=m.id WHERE m.id=$1',[id]);const x=r.rows[0];return x?{unread:x.direction==='incoming'&&!(x.seen_by_agent??false),seen_by_agent:x.seen_by_agent??false,processed:x.processed??false,dismissed:x.dismissed??false,qq_read:false as const}:undefined;}
  async query(f:InboxQuery={}):Promise<InboxQueryResult>{const p:unknown[]=[],w:string[]=[];const add=(q:(n:number)=>string,v:unknown)=>{p.push(v);w.push(q(p.length));};if(f.account_id)add(n=>`m.account_id=$${n}`,f.account_id);if(f.type)add(n=>`c.type=$${n}`,f.type);if(f.sender)add(n=>`(m.sender_id=$${n} OR lower(m.sender_name)=lower($${n}) OR lower(m.sender_card)=lower($${n}))`,f.sender);if(f.priority)add(n=>`m.priority=$${n}`,f.priority);if(f.at_me!==undefined)add(n=>`m.at_me=$${n}`,f.at_me);if(f.state){if(f.state==='unread')w.push(`m.direction='incoming' AND COALESCE(s.seen_by_agent,false)=false`);else w.push(`COALESCE(s.${f.state},false)=true`);}if(f.keyword?.trim())add(n=>`to_tsvector('simple', m.plain_text) @@ plainto_tsquery('simple', $${n})`,f.keyword.trim());if(f.since)add(n=>`m.sent_at >= $${n}`,f.since);if(f.until)add(n=>`m.sent_at <= $${n}`,f.until);const where=w.length?`WHERE ${w.join(' AND ')}`:'';const offset=Math.max(0,Math.floor(f.offset??0)),limit=Math.max(1,Math.min(200,Math.floor(f.limit??50)));const [c,r]=await Promise.all([this.db.query<{total:string}>(`SELECT COUNT(*)::text total FROM messages m JOIN conversations c ON c.id=m.conversation_id LEFT JOIN inbox_states s ON s.message_id=m.id ${where}`,p),this.db.query<DbMessage>(`SELECT ${columnsWithState} FROM messages m JOIN conversations c ON c.id=m.conversation_id LEFT JOIN inbox_states s ON s.message_id=m.id ${where} ORDER BY m.sent_at DESC,m.id DESC LIMIT $${p.length+1} OFFSET $${p.length+2}`,[...p,limit,offset])]);const total=Number(c.rows[0]?.total??0);return{messages:r.rows.map(decode),total,offset,limit,has_more:offset+limit<total};}
  async context(id:string,before=20,after=10){const t=await this.get(id);if(!t)return[];if(!Number.isFinite(before)||!Number.isFinite(after)||before<0||after<0)throw new Error('Context window must use finite nonnegative bounds');const r=await this.db.query<DbMessage>(`SELECT ${columns} FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.account_id=$1 AND m.conversation_id=(SELECT conversation_id FROM messages WHERE id=$2) ORDER BY m.sent_at,m.id`,[t.account_id,id]);const a=r.rows.map(decode),i=a.findIndex(x=>x.id===id);return a.slice(Math.max(0,i-Math.min(100,Math.trunc(before))),i+Math.min(100,Math.trunc(after))+1);}
+ async conversations(f:ConversationQuery={}):Promise<ConversationQueryResult>{
+    const p:unknown[]=[],w:string[]=[];
+    if(f.account_id){p.push(f.account_id);w.push(`m.account_id=$${p.length}`);}
+    if(f.type){p.push(f.type);w.push(`c.type=$${p.length}`);}
+    const where=w.length?`WHERE ${w.join(' AND ')}`:'';
+    const offset=Math.max(0,Math.floor(f.offset??0)),limit=Math.max(1,Math.min(200,Math.floor(f.limit??50)));
+    const [rows,total]=await Promise.all([
+      this.db.query<Record<string,unknown>>(`WITH filtered AS (
+          SELECT m.id,m.account_id,m.conversation_id,m.plain_text,m.sender_id,m.sender_name,m.sent_at,m.priority,m.direction
+          FROM messages m JOIN conversations c ON c.id=m.conversation_id ${where}
+        ), latest AS (
+          SELECT DISTINCT ON (conversation_id) * FROM filtered ORDER BY conversation_id, sent_at DESC, id DESC
+        ), counts AS (
+          SELECT conversation_id, COUNT(*)::int AS message_count FROM filtered GROUP BY conversation_id
+        ), unread AS (
+          SELECT x.conversation_id, COUNT(*)::int AS unread_count
+          FROM messages x LEFT JOIN inbox_states s ON s.message_id=x.id
+          WHERE x.direction='incoming' AND COALESCE(s.seen_by_agent,false)=false
+          GROUP BY x.conversation_id
+        )
+        SELECT l.conversation_id,l.account_id,l.id AS last_id,l.plain_text,l.sender_id,l.sender_name,l.sent_at,l.priority,l.direction,
+               c.type,c.group_id,c.peer_user_id,c.name AS title,t.message_count,COALESCE(u.unread_count,0) AS unread_count
+        FROM latest l
+        JOIN conversations c ON c.id=l.conversation_id
+        JOIN counts t ON t.conversation_id=l.conversation_id
+        LEFT JOIN unread u ON u.conversation_id=l.conversation_id
+        ORDER BY l.sent_at DESC,l.id DESC
+        LIMIT $${p.length+1} OFFSET $${p.length+2}`,[...p,limit,offset]),
+      this.db.query<{total:string}>(`SELECT COUNT(DISTINCT m.conversation_id)::text AS total FROM messages m JOIN conversations c ON c.id=m.conversation_id ${where}`,p),
+    ]);
+    const conversations=rows.rows.map(row=>{
+      const type=String(row.type) as 'private'|'group';
+      const storedTitle=typeof row.title==='string'&&row.title?row.title:null;
+      const senderName=typeof row.sender_name==='string'&&row.sender_name?row.sender_name:null;
+      return {
+        conversation_id:String(row.conversation_id),
+        account_id:String(row.account_id),
+        type,
+        group_id:row.group_id===null||row.group_id===undefined?null:String(row.group_id),
+        peer_user_id:row.peer_user_id===null||row.peer_user_id===undefined?null:String(row.peer_user_id),
+        title:storedTitle??(type==='private'&&row.direction==='incoming'?senderName:null),
+        last_message:{
+          id:String(row.last_id),
+          plain_text:String(row.plain_text??''),
+          sender_id:String(row.sender_id??''),
+          sender_name:senderName,
+          sent_at:new Date(row.sent_at as string|Date).toISOString(),
+          priority:String(row.priority) as NormalizedMessage['priority'],
+          direction:String(row.direction) as NormalizedMessage['direction'],
+        },
+        message_count:Number(row.message_count??0),
+        unread_count:Number(row.unread_count??0),
+        last_at:new Date(row.sent_at as string|Date).toISOString(),
+      };
+    });
+    const totalCount=Number(total.rows[0]?.total??0);
+    return{conversations,total:totalCount,offset,limit,has_more:offset+limit<totalCount};
+  }
+ async conversationMessages(conversationId:string,f:ConversationMessageQuery={}):Promise<ConversationMessageResult>{
+    const p:unknown[]=[conversationId],w:string[]=['m.conversation_id=$1'];
+    if(f.account_id){p.push(f.account_id);w.push(`m.account_id=$${p.length}`);}
+    if(f.before){p.push(f.before);w.push(`m.sent_at < $${p.length}`);}
+    const limit=Math.max(1,Math.min(200,Math.floor(f.limit??50)));
+    const r=await this.db.query<DbMessage>(`SELECT ${columnsWithState} FROM messages m JOIN conversations c ON c.id=m.conversation_id LEFT JOIN inbox_states s ON s.message_id=m.id WHERE ${w.join(' AND ')} ORDER BY m.sent_at DESC,m.id DESC LIMIT $${p.length+1}`,[...p,limit+1]);
+    const hasMore=r.rows.length>limit;
+    const messages=r.rows.slice(0,limit).map(decode).reverse();
+    return{conversation_id:conversationId,messages,has_more:hasMore};
+  }
  static fromPool(pool:Pool|PoolClient){return new PostgresMessageStore(pool as unknown as SqlClient);}
 }
