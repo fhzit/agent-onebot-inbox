@@ -24,9 +24,14 @@ export type McpAttachmentService = {
 };
 
 export interface McpService {
+  /** Server instance owned by the stdio transport. */
   server: McpServer;
   connectStdio(): Promise<void>;
-  createHttpTransport(): StreamableHTTPServerTransport;
+  /**
+   * The SDK's stateless HTTP mode requires one McpServer per request; a single
+   * server instance cannot be connected to a second transport while one is open.
+   */
+  createHttpSession(): { server: McpServer; transport: StreamableHTTPServerTransport };
 }
 
 /**
@@ -50,50 +55,56 @@ export function createMcpService(
   _aiAdvisories?: { store: Pick<PostgresAiAdvisoryStore, 'list'>; allowedAccountIds: readonly string[] },
   dataTools?: McpDataToolOptions,
 ): McpService {
-  const server = new McpServer({ name: 'agent-onebot-inbox', version: '0.1.0' });
-  server.registerTool('service_info', {
-    description: 'Return static service identity and version information.',
-    inputSchema: {},
-  }, async () => ({
-    content: [{ type: 'text', text: JSON.stringify({ service: 'agent-onebot-inbox', version: '0.1.0' }) }],
-  }));
-  server.registerTool('system_status', {
-    description: 'Return static MCP capability availability and service health without account or message data.',
-    inputSchema: {},
-  }, async () => ({
-    content: [{ type: 'text', text: JSON.stringify({
-      service: 'agent-onebot-inbox',
-      version: '0.1.0',
-      status: 'ok',
-      capabilities: {
-        account_data: false,
-        message_data: false,
-        contacts: false,
-        attachments: false,
-        administration: false,
-      },
-    }) }],
-  }));
-  // Explicit account IDs do not prove the connected caller's entitlement.
-  // Opt-in data tools are scoped to the caller-configured account list instead.
-  if (dataTools) {
-    registerInboxTools(server, dataTools.store, dataTools.allowedAccountIds);
-    if (dataTools.contacts) {
-      registerContactsListTool(server, dataTools.contacts);
-      registerGroupMembersTool(server, dataTools.contacts);
-      registerContactsSearchTool(server, dataTools.contacts);
+  const buildServer = (): McpServer => {
+    const server = new McpServer({ name: 'agent-onebot-inbox', version: '0.1.0' });
+    server.registerTool('service_info', {
+      description: 'Return static service identity and version information.',
+      inputSchema: {},
+    }, async () => ({
+      content: [{ type: 'text', text: JSON.stringify({ service: 'agent-onebot-inbox', version: '0.1.0' }) }],
+    }));
+    server.registerTool('system_status', {
+      description: 'Return static MCP capability availability and service health without account or message data.',
+      inputSchema: {},
+    }, async () => ({
+      content: [{ type: 'text', text: JSON.stringify({
+        service: 'agent-onebot-inbox',
+        version: '0.1.0',
+        status: 'ok',
+        capabilities: {
+          account_data: Boolean(dataTools),
+          message_data: Boolean(dataTools),
+          contacts: Boolean(dataTools?.contacts),
+          attachments: false,
+          administration: false,
+        },
+      }) }],
+    }));
+    // Explicit account IDs do not prove the connected caller's entitlement.
+    // Opt-in data tools are scoped to the caller-configured account list instead.
+    if (dataTools) {
+      registerInboxTools(server, dataTools.store, dataTools.allowedAccountIds);
+      if (dataTools.contacts) {
+        registerContactsListTool(server, dataTools.contacts);
+        registerGroupMembersTool(server, dataTools.contacts);
+        registerContactsSearchTool(server, dataTools.contacts);
+      }
     }
-  }
+    return server;
+  };
 
-  // Account IDs from process environment are not caller authentication. Do not
-  // register data tools until a verified transport principal is available.
+  const stdioServer = buildServer();
   return {
-    server,
+    server: stdioServer,
     async connectStdio() {
-      await server.connect(new StdioServerTransport());
+      await stdioServer.connect(new StdioServerTransport());
     },
-    createHttpTransport() {
-      return new StreamableHTTPServerTransport() as unknown as import('@modelcontextprotocol/sdk/shared/transport.js').Transport & StreamableHTTPServerTransport;
+    createHttpSession() {
+      return {
+        server: buildServer(),
+        // No sessionIdGenerator: the SDK then runs in stateless mode.
+        transport: new StreamableHTTPServerTransport(),
+      };
     },
   };
 }

@@ -963,11 +963,14 @@ const peers = new Map<string, Peer>();
     if (url.pathname === '/mcp') {
       if (req.method !== 'POST') { respond(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Use MCP POST', retryable: false } }); return; }
       if (!safeTokenEqual(config.apiToken, bearer(req))) { respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } }); return; }
-      const transport = mcp.createHttpTransport();
-      void mcp.server.connect(transport as unknown as import('@modelcontextprotocol/sdk/shared/transport.js').Transport).then(() => {
+      // Stateless mode: a fresh server+transport pair per request, as the SDK requires.
+      const { server: requestServer, transport } = mcp.createHttpSession();
+      res.once('close', () => { void transport.close().catch(() => {}); });
+      void requestServer.connect(transport as unknown as import('@modelcontextprotocol/sdk/shared/transport.js').Transport).then(() => {
         transport.onerror = error => logger.warn({ error: error.message }, 'MCP transport error');
         return transport.handleRequest(req, res);
       }).catch(error => { logger.warn({ error: error instanceof Error ? error.message : 'MCP error' }, 'MCP request failed'); if (!res.headersSent) respond(res, 500, { error: { code: 'MCP_ERROR', message: 'MCP request failed', retryable: true } }); });
+
       return;
     }
     void appHandler(req, res);
