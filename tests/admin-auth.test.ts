@@ -99,6 +99,32 @@ test('console password, managed API keys and the bootstrap token stay separate',
   }
 });
 
+test('notification webhook accepts private-network http but rejects public http', async () => {
+  const runtime = await startServer(config);
+  const address = runtime.address();
+  assert.ok(address);
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const login = await fetch(`${base}/api/admin/session`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'console-pass' }),
+    });
+    const session = cookieOf(login);
+    const put = (webhookUrl: string) => fetch(`${base}/api/admin/notifications`, {
+      method: 'PUT', headers: { cookie: session, 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: true, webhookUrl, webhookSecret: 's3cret', minPriority: 'P1', includePreview: true, includeContext: true, maxAttempts: 3, timeoutMs: 5000 }),
+    });
+    assert.equal((await put('http://172.18.0.9:8644/webhooks/aoi-alerts')).status, 200, 'private http allowed');
+    assert.equal((await put('http://10.0.0.5:8644/hook')).status, 200, '10/8 allowed');
+    assert.equal((await put('https://hooks.example.com/aoi')).status, 200, 'public https allowed');
+    assert.equal((await put('http://hooks.example.com/aoi')).status, 400, 'public http rejected');
+    const stored = await (await fetch(`${base}/api/admin/notifications`, { headers: { cookie: session } })).json();
+    assert.equal(stored.settings.webhookUrl, 'https://hooks.example.com/aoi');
+    assert.equal(stored.settings.webhookSecretConfigured, true);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('console login is disabled when ADMIN_PASSWORD is unset', async () => {
   const { adminPassword: _omitted, ...withoutPassword } = config;
   const runtime = await startServer(withoutPassword);
