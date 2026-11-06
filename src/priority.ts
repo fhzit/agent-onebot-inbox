@@ -29,15 +29,22 @@ export function priorityForScore(score: number): Priority {
   return 'P4';
 }
 function scopeMatches(scope: { accountIds?: string[] }, accountId: string): boolean {
-  return !scope.accountIds || scope.accountIds.includes(accountId);
+  // An empty scope list is "no restriction", never "matches nothing".
+  return !scope.accountIds || scope.accountIds.length === 0 || scope.accountIds.includes(accountId);
 }
+const unset = (values: readonly unknown[] | undefined): boolean => !values || values.length === 0;
+/**
+ * A rule field that is present but empty must mean "no restriction". Persisted
+ * rules round-trip with `[]` for unused fields, and treating `[]` as a filter
+ * made every such rule match nothing.
+ */
 function matches(rule: PriorityRule, input: PriorityInput): boolean {
   return scopeMatches(rule, input.accountId)
-    && (!rule.conversationTypes || rule.conversationTypes.includes(input.conversationType))
-    && (!rule.groupIds || (input.groupId != null && rule.groupIds.includes(input.groupId)))
-    && (!rule.senderIds || rule.senderIds.includes(input.senderId))
+    && (unset(rule.conversationTypes) || rule.conversationTypes!.includes(input.conversationType))
+    && (unset(rule.groupIds) || (input.groupId != null && rule.groupIds!.includes(String(input.groupId))))
+    && (unset(rule.senderIds) || rule.senderIds!.includes(input.senderId))
     && (rule.atMe !== true || (input.atMe && !input.atAll))
-    && (!rule.keywords || rule.keywords.some(k => k.length > 0 && input.text.toLocaleLowerCase().includes(k.toLocaleLowerCase())));
+    && (unset(rule.keywords) || rule.keywords!.some(k => k.length > 0 && input.text.toLocaleLowerCase().includes(k.toLocaleLowerCase())));
 }
 export function applyPriority(message: NormalizedMessage, config: PriorityConfig, override?: { priority: Priority }): NormalizedMessage {
   const result = scorePriority({ accountId: message.account_id, conversationType: message.conversation_type, groupId: message.group_id, senderId: message.sender_id, text: message.plain_text, atMe: message.at_me, atAll: message.at_all, baseScore: message.priority_score, ...(override ? { override } : {}) }, config);

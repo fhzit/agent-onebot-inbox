@@ -39,11 +39,12 @@ export class PostgresPriorityStore implements PriorityStore {
           kind: actions.kind === 'hard' ? 'hard' : 'weighted',
           weight: typeof actions.weight === 'number' ? actions.weight : 0,
           ...(isPriority(actions.priority) ? { priority: actions.priority } : {}),
-          ...((Array.isArray(scope.accountIds) && scope.accountIds.every(x => typeof x === 'string')) ? { accountIds: scope.accountIds as string[] } : {}),
-          ...(Array.isArray(conditions.keywords) && conditions.keywords.every(x => typeof x === 'string') ? { keywords: conditions.keywords as string[] } : {}),
-          ...(Array.isArray(conditions.conversationTypes) && conditions.conversationTypes.every(x => x === 'private' || x === 'group') ? { conversationTypes: conditions.conversationTypes as Array<'private'|'group'> } : {}),
-          ...(Array.isArray(conditions.groupIds) && conditions.groupIds.every(x => typeof x === 'string') ? { groupIds: conditions.groupIds as string[] } : {}),
-          ...(Array.isArray(conditions.senderIds) && conditions.senderIds.every(x => typeof x === 'string') ? { senderIds: conditions.senderIds as string[] } : {}),
+          // An empty scope means "all accounts". Keeping [] would make scopeMatches() reject everything.
+          ...((Array.isArray(scope.accountIds) && scope.accountIds.length > 0 && scope.accountIds.every(x => typeof x === 'string')) ? { accountIds: scope.accountIds as string[] } : {}),
+          ...(Array.isArray(conditions.keywords) && conditions.keywords.length > 0 && conditions.keywords.every(x => typeof x === 'string') ? { keywords: conditions.keywords as string[] } : {}),
+          ...(Array.isArray(conditions.conversationTypes) && conditions.conversationTypes.length > 0 && conditions.conversationTypes.every(x => x === 'private' || x === 'group') ? { conversationTypes: conditions.conversationTypes as Array<'private'|'group'> } : {}),
+          ...(Array.isArray(conditions.groupIds) && conditions.groupIds.length > 0 && conditions.groupIds.every(x => typeof x === 'string') ? { groupIds: conditions.groupIds as string[] } : {}),
+          ...(Array.isArray(conditions.senderIds) && conditions.senderIds.length > 0 && conditions.senderIds.every(x => typeof x === 'string') ? { senderIds: conditions.senderIds as string[] } : {}),
           ...(conditions.atMe === true ? { atMe: true } : {}),
         };
       }),
