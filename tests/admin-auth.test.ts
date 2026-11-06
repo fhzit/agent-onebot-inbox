@@ -119,6 +119,30 @@ test('console login is disabled when ADMIN_PASSWORD is unset', async () => {
   }
 });
 
+test('console session authorizes every admin read route the settings tab loads', async () => {
+  const runtime = await startServer(config);
+  const address = runtime.address();
+  assert.ok(address);
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const paths = ['/api/admin/accounts', '/api/admin/notifications', '/api/admin/audit', '/api/admin/provider-qualification', '/api/summary', '/api/accounts'];
+    for (const path of paths) {
+      assert.equal((await fetch(`${base}${path}`)).status, 401, `${path} rejects anonymous reads`);
+    }
+    const login = await fetch(`${base}/api/admin/session`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'console-pass' }),
+    });
+    const session = cookieOf(login);
+    for (const path of paths) {
+      const response = await fetch(`${base}${path}`, { headers: { cookie: session } });
+      // Method or storage differences may answer 405/503; auth must never fail with 401.
+      assert.notEqual(response.status, 401, `${path} accepts the console session (got ${response.status})`);
+    }
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('session cookies reject tampering, expiry and throttled brute force', () => {
   const session = createAdminSession({ password: 'console-pass', ttlMs: 60_000, maxAttempts: 3, windowMs: 60_000 });
   const ok = session.login('console-pass', { secure: true });
