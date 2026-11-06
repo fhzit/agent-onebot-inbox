@@ -228,7 +228,9 @@ function queryFilters(params: URLSearchParams): InboxQuery {
   if(type!==null&&type!=='private'&&type!=='group')throw new Error('Invalid type');
   if(priority!==null&&!['P0','P1','P2','P3','P4'].includes(priority))throw new Error('Invalid priority');
   if(at!==null&&at!=='true'&&at!=='false')throw new Error('Invalid at_me');
-  return {account_id:params.get('account_id')??undefined,type:type as InboxQuery['type']??undefined,sender:params.get('sender')??undefined,priority:priority as InboxQuery['priority']??undefined,at_me:at===null?undefined:at==='true',keyword:params.get('keyword')??undefined,since:params.get('since')??undefined,until:params.get('until')??undefined,offset:number('offset',0),limit:number('limit',50), ...(stateFilters[0]?{state:stateFilters[0]}:{}) };
+  const direction=params.get('direction');
+  if(direction!==null&&direction!=='incoming'&&direction!=='outgoing')throw new Error('Invalid direction');
+  return {account_id:params.get('account_id')??undefined,type:type as InboxQuery['type']??undefined,direction:direction as InboxQuery['direction']??undefined,sender:params.get('sender')??undefined,priority:priority as InboxQuery['priority']??undefined,at_me:at===null?undefined:at==='true',keyword:params.get('keyword')??undefined,since:params.get('since')??undefined,until:params.get('until')??undefined,offset:number('offset',0),limit:number('limit',50), ...(stateFilters[0]?{state:stateFilters[0]}:{}) };
 }
 function parseAttachmentMaxBytes(raw: string | undefined): number {
   if (raw === undefined || raw === '') return 10 * 1024 * 1024;

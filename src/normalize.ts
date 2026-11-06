@@ -9,6 +9,7 @@ export type OneBotEvent = {
   sub_type?: string;
   message_id?: number | string;
   user_id?: number | string;
+  target_id?: number | string;
   group_id?: number | string;
   message?: string | Segment[];
   raw_message?: string;
@@ -80,16 +81,21 @@ export function priorityFor(score: number): NormalizedMessage['priority'] {
 }
 
 export function normalizeEvent(accountId: string, provider: string, transportId: string, event: OneBotEvent): NormalizedMessage | null {
-  if (event.post_type !== 'message' || !event.message_type) return null;
+  if ((event.post_type !== 'message' && event.post_type !== 'message_sent') || !event.message_type) return null;
+  // ``message_sent`` is the account's own message (sent from any client QQ syncs back);
+  // it is stored as outgoing so digests can tell "he already answered this".
+  const outgoing = event.post_type === 'message_sent';
   const selfId = String(event.self_id ?? '');
-  const senderId = String(event.user_id ?? event.sender?.user_id ?? '');
+  const senderId = outgoing ? selfId : String(event.user_id ?? event.sender?.user_id ?? '');
   const groupId = event.message_type === 'group' ? String(event.group_id ?? '') : null;
+  // For message_sent: user_id is the account itself, target_id is the counterpart.
+  const peerId = groupId ? null : (outgoing ? String(event.target_id ?? event.user_id ?? '') : senderId);
   const segments = normalizeSegments(event.message);
   const text = segments.filter(s => s.type === 'text').map(s => String(s.data.text ?? '')).join('');
   const atUsers = segments.filter(s => s.type === 'at').map(s => String(s.data.qq ?? '')).filter(Boolean);
-  const atAll = atUsers.includes('all');
-  const atMe = !atAll && atUsers.includes(selfId);
-  let score = event.message_type === 'private' ? 15 : 0;
+  const atAll = !outgoing && atUsers.includes('all');
+  const atMe = !outgoing && !atAll && atUsers.includes(selfId);
+  let score = outgoing ? 0 : (event.message_type === 'private' ? 15 : 0);
   if (atMe) score += 25;
   const id = String(event.message_id ?? '');
   const sentAt = new Date((event.time ?? Date.now() / 1000) * 1000).toISOString();
@@ -97,18 +103,18 @@ export function normalizeEvent(accountId: string, provider: string, transportId:
   // timestamp otherwise falls back to Date.now(), making HTTP/WS retries diverge.
   const stableTime = event.time === undefined ? null : event.time;
   const fingerprint = createHash('sha256').update(JSON.stringify(id
-    ? [accountId, event.message_type, groupId ?? senderId, senderId, id]
-    : [accountId, event.message_type, groupId ?? senderId, senderId, stableTime, segments])).digest('hex');
+    ? [accountId, event.message_type, groupId ?? peerId, senderId, id]
+    : [accountId, event.message_type, groupId ?? peerId, senderId, stableTime, segments])).digest('hex');
   const scoreBounded = Math.max(0, Math.min(score, 100));
   return {
     id: createHash('sha256').update(`${accountId}:${id || fingerprint}`).digest('hex'),
     account_id: accountId, provider_id: provider, transport_id: transportId,
-    direction: 'incoming', external_message_id: id || null, client_request_id: null,
+    direction: outgoing ? 'outgoing' : 'incoming', external_message_id: id || null, client_request_id: null,
     event_fingerprint: fingerprint,
-    conversation_id: `${accountId}:${event.message_type}:${groupId ?? senderId}`,
+    conversation_id: `${accountId}:${event.message_type}:${groupId ?? peerId}`,
     conversation_type: event.message_type, group_id: groupId,
-    peer_user_id: groupId ? null : senderId, sender_id: senderId,
-    sender_name: event.sender?.nickname ?? null, sender_card: event.sender?.card ?? null,
+    peer_user_id: peerId, sender_id: senderId,
+    sender_name: outgoing ? '我' : (event.sender?.nickname ?? null), sender_card: outgoing ? null : (event.sender?.card ?? null),
     sent_at: sentAt, received_at: new Date().toISOString(), plain_text: text,
     raw_message: event.message ?? null, segments, reply_to_message_id: null,
     at_users: atUsers, at_me: atMe, at_all: atAll,

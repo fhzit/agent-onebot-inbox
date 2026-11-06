@@ -1,7 +1,7 @@
 import type { NormalizedMessage } from './normalize.js';
 
 export interface InboxQuery {
-  account_id?: string | undefined; type?: 'private' | 'group' | undefined; sender?: string | undefined; priority?: NormalizedMessage['priority'] | undefined; at_me?: boolean | undefined; keyword?: string | undefined; since?: string | undefined; until?: string | undefined; offset?: number | undefined; limit?: number | undefined; state?: 'unread'|'processed'|'dismissed'|undefined;
+  account_id?: string | undefined; type?: 'private' | 'group' | undefined; direction?: 'incoming' | 'outgoing' | undefined; sender?: string | undefined; priority?: NormalizedMessage['priority'] | undefined; at_me?: boolean | undefined; keyword?: string | undefined; since?: string | undefined; until?: string | undefined; offset?: number | undefined; limit?: number | undefined; state?: 'unread'|'processed'|'dismissed'|undefined;
 }
 export interface InboxQueryResult { messages: NormalizedMessage[]; total: number; offset: number; limit: number; has_more: boolean; }
 
@@ -122,6 +122,7 @@ export class MessageStore {
     const matches = [...this.#byId.values()].filter(m =>
       (!filters.account_id || m.account_id === filters.account_id) &&
       (!filters.type || m.conversation_type === filters.type) &&
+      (!filters.direction || m.direction === filters.direction) &&
       (!filters.sender || m.sender_id === filters.sender || m.sender_name?.toLocaleLowerCase() === filters.sender.toLocaleLowerCase() || m.sender_card?.toLocaleLowerCase() === filters.sender.toLocaleLowerCase()) &&
       (!filters.priority || m.priority === filters.priority) &&
       (filters.at_me === undefined || m.at_me === filters.at_me) &&
