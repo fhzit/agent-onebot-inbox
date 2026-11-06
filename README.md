@@ -57,6 +57,7 @@ cp .env.example .env
 HOST=127.0.0.1
 PORT=8080
 API_TOKEN=替换为独立的高熵随机密钥
+ADMIN_PASSWORD=替换为管理面板专用的高熵密码
 ACCOUNTS_JSON='[{"id":"main","alias":"主号","self_id":"12345678","provider":"napcat","access_token":"替换为另一个独立密钥","permission":"readonly"}]'
 ```
 

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { retrieveAttachment, type ProviderFileRetriever } from './retrieval.js';
 
 export type AttachmentRouteAccount = { permission: string; retrieve: ProviderFileRetriever };
-export type AttachmentRouteOptions = { apiToken: string; allowedRoots: readonly string[]; maxBytes: number; resolveAccount: (accountId: string) => AttachmentRouteAccount | undefined | Promise<AttachmentRouteAccount | undefined> };
+export type AttachmentRouteOptions = { apiToken: string; allowedRoots: readonly string[]; maxBytes: number; resolveAccount: (accountId: string) => AttachmentRouteAccount | undefined | Promise<AttachmentRouteAccount | undefined>; /** Optional caller-supplied authorization (console session or managed API key). */ isAuthorized?: (req: IncomingMessage) => boolean | Promise<boolean> };
 const digest = (value: string) => createHmac('sha256', 'attachment-route').update(value).digest();
 function authorized(req: IncomingMessage, token: string): boolean {
   const header = req.headers.authorization ?? '';
@@ -24,7 +24,8 @@ export function createAttachmentRouteHandler(options: AttachmentRouteOptions) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<boolean> => {
     const match = (req.url ?? '').split('?')[0]!.match(/^\/api\/attachments\/([^/]+)\/([^/]+)$/);
     if (req.method !== 'GET' || !match) return false;
-    if (!authorized(req, options.apiToken)) { fail(res, 401); return true; }
+    const allowed = options.isAuthorized ? await options.isAuthorized(req) : authorized(req, options.apiToken);
+    if (!allowed) { fail(res, 401); return true; }
     let accountId: string, fileId: string;
     try { accountId = decodeURIComponent(match[1]!); fileId = decodeURIComponent(match[2]!); } catch { fail(res, 404); return true; }
     if (!accountId || !fileId || /[\\/]/.test(fileId)) { fail(res, 404); return true; }

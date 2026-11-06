@@ -63,6 +63,8 @@ import { PostgresAiAdvisoryRetentionRepository } from './ai-advisory-retention-a
 import { executeAiAdvisoryRetentionBatch, type AiAdvisoryRetentionTransactionRunner } from './ai-advisory-retention-transaction.js';
 import type { AiAdvisoryRetentionRepository } from './ai-advisory-retention.js';
 import { validateAiAdvisoryRetentionPolicy, type ValidatedAiAdvisoryRetentionPolicy } from './ai-advisory-retention-policy.js';
+import { createAdminSession } from './admin-session.js';
+import { MemoryApiKeyStore, PostgresApiKeyStore, type ApiKeyStore } from './api-key-store.js';
 
 export type Peer = { account: AccountConfig; socket: WebSocket; connectedAt: number; pending: Map<string, (value: unknown) => void> };
 class MemoryContactsStore implements ContactsStore{private snapshots=new Map<string,ContactsSnapshot>();async get(id:string){return structuredClone(this.snapshots.get(id)??{friends:[],groups:[],members:[],last_synced:{friends:null,groups:null,members:{}}});}async search(accountId:string,query:string,limit=50){const snapshot=await this.get(accountId);const contacts:import('./contact-resolver.js').Contact[]=[...snapshot.friends.map(f=>({account_id:accountId,qq_id:String(f.user_id),...(f.nickname!==undefined?{nickname:f.nickname}:{}),...(f.remark!==undefined?{remark:f.remark}:{})})),...snapshot.members.flatMap(g=>g.members.map(m=>({account_id:accountId,qq_id:String(m.user_id),...(m.nickname!==undefined?{nickname:m.nickname}:{}),...(m.card!==undefined?{card:m.card}:{}),group_id:g.group_id})))];const result=resolveContact(contacts,accountId,query);return{...result,results:result.candidates.slice(0,Math.min(100,Math.max(1,limit)))};}async replaceFriends(id:string,rows:readonly import('./contacts-cache.js').Friend[],syncedAt=new Date()){const s=await this.get(id);s.friends=[...rows];s.last_synced.friends=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroups(id:string,rows:readonly import('./contacts-cache.js').Group[],syncedAt=new Date()){const s=await this.get(id);s.groups=[...rows];s.last_synced.groups=syncedAt.toISOString();this.snapshots.set(id,s);}async replaceGroupMembers(id:string,groupId:string|number,rows:readonly import('./contacts-cache.js').GroupMember[],syncedAt=new Date()){const s=await this.get(id);s.members=s.members.filter(x=>x.group_id!==String(groupId));s.members.push({group_id:String(groupId),members:[...rows]});s.last_synced.members[String(groupId)]=syncedAt.toISOString();this.snapshots.set(id,s);}}
@@ -82,6 +84,10 @@ async function readBody(req: IncomingMessage, max: number): Promise<unknown> {
 }
 function respond(res: ServerResponse, code: number, body: unknown): void {
   res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(body));
+}
+function respondWithCookie(res: ServerResponse, code: number, body: unknown, cookie: string): void {
+  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'set-cookie': cookie });
+  res.end(JSON.stringify(body));
 }
 function respondMetrics(res: ServerResponse, body: string): void {
   res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' }); res.end(body);
@@ -236,6 +242,25 @@ export async function startServer(config: AppConfig, store?: MessageStore | Post
   if(!config.apiToken)throw new Error('API_TOKEN is required; authenticated API cannot run without a token');
   let pool:Pool|undefined;let runtimeStore:MessageStore|PostgresMessageStore=store??new MessageStore();
   let auditStore:AuditStore|undefined;
+  // Console password auth is independent from API bearer credentials.
+  const adminSession=createAdminSession({password:config.adminPassword,secret:config.adminSessionSecret});
+  let apiKeyStore:ApiKeyStore|undefined;
+  const getApiKeyStore=():ApiKeyStore=>(apiKeyStore??=pool?new PostgresApiKeyStore(pool):new MemoryApiKeyStore());
+  const isSecureRequest=(req:IncomingMessage):boolean=>{
+    const proto=String(req.headers['x-forwarded-proto']??'').split(',')[0]?.trim();
+    return proto==='https'||Boolean((req.socket as {encrypted?:boolean}).encrypted);
+  };
+  const clientKey=(req:IncomingMessage):string=>String(req.headers['cf-connecting-ip']??req.headers['x-forwarded-for']??req.socket.remoteAddress??'unknown').split(',')[0]!.trim();
+  /** Console session, the bootstrap API token, or a console-minted API key. */
+  const requestIsAuthorized=async(req:IncomingMessage):Promise<boolean>=>{
+    if(adminSession.isAuthenticated(req))return true;
+    const token=bearer(req);
+    if(!token)return false;
+    if(safeTokenEqual(config.apiToken,token))return true;
+    return (await getApiKeyStore().verify(token))!==null;
+  };
+  if(!adminSession.enabled)logger.warn({},'ADMIN_PASSWORD is not configured; console login is disabled');
+
   if(!store&&options.databaseUrl){
     if(!options.accountEncryptionKey)throw new Error('ACCOUNT_ENCRYPTION_KEY is required for persistent account settings');
     if(options.accountStore){
@@ -338,9 +363,9 @@ const peers = new Map<string, Peer>();
       void refresh();
     }
   };
-  const attachmentHandler=createAttachmentRouteHandler({apiToken:config.apiToken,allowedRoots:(process.env.ATTACHMENT_ALLOWED_ROOTS??'').split(path.delimiter).filter(Boolean),maxBytes:attachmentMaxBytes,resolveAccount:accountId=>{const account=accountById(config,accountId);return account&&attachmentActionUrlHostAllowed(account,process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS)?{permission:account.permission,retrieve:createOneBotFileRetriever(onebot,account)}:undefined;}});
+  const attachmentHandler=createAttachmentRouteHandler({apiToken:config.apiToken,isAuthorized:req=>requestIsAuthorized(req),allowedRoots:(process.env.ATTACHMENT_ALLOWED_ROOTS??'').split(path.delimiter).filter(Boolean),maxBytes:attachmentMaxBytes,resolveAccount:accountId=>{const account=accountById(config,accountId);return account&&attachmentActionUrlHostAllowed(account,process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS)?{permission:account.permission,retrieve:createOneBotFileRetriever(onebot,account)}:undefined;}});
   const historyReconciliationHandler = createHistoryReconciliationHttpHandler({
-    isAuthorized: req => safeTokenEqual(config.apiToken, bearer(req)),
+    isAuthorized: req => requestIsAuthorized(req),
     resolveAccount: id => accountById(config, id),
     ...(options.historyReconciliation?.maxBodyBytes !== undefined ? { maxBodyBytes: options.historyReconciliation.maxBodyBytes } : {}),
     service: options.historyReconciliation?.service ?? (auditStore
@@ -386,8 +411,53 @@ const peers = new Map<string, Peer>();
   const appHandler = async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     try {
+      // Console authentication: password login issues an HttpOnly session cookie, no token in the browser.
+      if (url.pathname === '/api/admin/session') {
+        if (req.method === 'POST') {
+          const body = await readBody(req, config.maxMessageBytes);
+          const password = body && typeof body === 'object' && !Array.isArray(body) ? String((body as Record<string, unknown>).password ?? '') : '';
+          const result = adminSession.login(password, { secure: isSecureRequest(req), clientKey: clientKey(req) });
+          if (result.ok) {
+            if (auditStore) await auditStore.record({ actor: 'admin', action: 'admin.session.login', target_type: 'session', target_id: 'console', result: 'success' });
+            return respondWithCookie(res, 200, { authenticated: true, expires_at: new Date(result.expiresAt).toISOString() }, result.cookie);
+          }
+          if (auditStore) await auditStore.record({ actor: 'admin', action: 'admin.session.login', target_type: 'session', target_id: 'console', result: 'failure', metadata: { reason: result.reason } });
+          if (result.reason === 'disabled') return respond(res, 503, { error: { code: 'ADMIN_LOGIN_DISABLED', message: 'ADMIN_PASSWORD is not configured', retryable: false } });
+          if (result.reason === 'throttled') {
+            res.setHeader('retry-after', String(result.retryAfterSeconds ?? 60));
+            return respond(res, 429, { error: { code: 'TOO_MANY_ATTEMPTS', message: 'Too many failed attempts; retry later', retryable: true } });
+          }
+          return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Invalid console password', retryable: false } });
+        }
+        if (req.method === 'GET' || req.method === 'HEAD') return respond(res, 200, { authenticated: adminSession.isAuthenticated(req), mode: 'password', password_configured: adminSession.enabled });
+        if (req.method === 'DELETE') return respondWithCookie(res, 200, { authenticated: false }, adminSession.logoutCookie({ secure: isSecureRequest(req) }));
+      }
+      // API key management is console-session only: an API key must never mint or revoke other keys.
+      if (url.pathname.startsWith('/api/admin/api-keys')) {
+        if (!adminSession.isAuthenticated(req)) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Console session required', retryable: false } });
+        const keyStore = getApiKeyStore();
+        if (url.pathname === '/api/admin/api-keys') {
+          if (req.method === 'GET') return respond(res, 200, { keys: await keyStore.list() });
+          if (req.method === 'POST') {
+            const body = await readBody(req, config.maxMessageBytes);
+            const name = body && typeof body === 'object' && !Array.isArray(body) ? String((body as Record<string, unknown>).name ?? '').trim() : '';
+            if (!name || name.length > 120) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'name is required (max 120 characters)', retryable: false } });
+            const created = await keyStore.create(name);
+            if (auditStore) await auditStore.record({ actor: 'admin', action: 'admin.api_key.create', target_type: 'api_key', target_id: created.record.id, result: 'success', metadata: { name } });
+            return respond(res, 201, { key: created.key, record: created.record, warning: 'This key is shown once; store it now.' });
+          }
+          return respond(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Use GET or POST', retryable: false } });
+        }
+        const revokeMatch = url.pathname.match(/^\/api\/admin\/api-keys\/([A-Za-z0-9_-]{1,64})\/revoke$/);
+        if (revokeMatch && req.method === 'POST') {
+          const revoked = await keyStore.revoke(revokeMatch[1]!);
+          if (auditStore) await auditStore.record({ actor: 'admin', action: 'admin.api_key.revoke', target_type: 'api_key', target_id: revokeMatch[1]!, result: revoked ? 'success' : 'failure' });
+          return revoked ? respond(res, 200, { revoked: true }) : respond(res, 404, { error: { code: 'NOT_FOUND', message: 'Active key not found', retryable: false } });
+        }
+        return respond(res, 404, { error: { code: 'NOT_FOUND', message: 'Route not found', retryable: false } });
+      }
       if (url.pathname === '/api/admin/ai-advisory-retention/preview' || url.pathname === '/api/admin/ai-advisory-retention/apply') {
-        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         if (!retentionPolicy || !retentionRepository || !options.aiAdvisories?.enabled) return respond(res, 503, { error: { code: 'RETENTION_UNAVAILABLE', message: 'Advisory retention is not enabled', retryable: false } });
         let body: Record<string, unknown>;
         try { const raw = await readBody(req, Math.min(config.maxMessageBytes, 16384)); if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(); body = raw as Record<string, unknown>; }
@@ -494,7 +564,7 @@ const peers = new Map<string, Peer>();
         return respond(res, 200, { status: result.inserted ? 'stored' : 'duplicate', message_id: result.message.id });
       }
       if (req.method === 'GET' && url.pathname === '/api/ai-advisories') {
-        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         if (!aiAdvisoryStore || !options.aiAdvisories?.enabled) return respond(res, 503, { error: { code: 'AI_ADVISORIES_UNAVAILABLE', message: 'AI advisory persistence is not enabled', retryable: false } });
         const accountId = url.searchParams.get('account_id');
         if (!accountId || !options.aiAdvisories?.enabled || !options.aiAdvisories.accountIds.includes(accountId)) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown or unauthorized account', retryable: false } });
@@ -510,11 +580,11 @@ const peers = new Map<string, Peer>();
         return respond(res, 200, { advisories, next_cursor: advisories.length === limit ? `${advisories[advisories.length - 1]!.createdAt}|${advisories[advisories.length - 1]!.messageId}` : null });
       }
       if (req.method === 'GET' && url.pathname === '/api/accounts') {
-        if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (config.apiToken && !(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         return respond(res, 200, { accounts: config.accounts.map(({ access_token: _secret, ...a }) => ({ ...a, connected: peers.has(a.id) && peers.get(a.id)!.socket.readyState === WebSocket.OPEN })) });
       }
       if (req.method === 'GET' && url.pathname === '/api/messages') {
-        if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (config.apiToken && !(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const params = queryFilters(url.searchParams);
         if (params.account_id && !accountById(config, params.account_id)) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown account', retryable: false } });
         const result = await store.query(params);
@@ -522,7 +592,7 @@ const peers = new Map<string, Peer>();
         return respond(res, 200, { ...result, messages });
       }
       if (req.method === 'GET' && url.pathname === '/api/conversations') {
-        if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (config.apiToken && !(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const accountId = url.searchParams.get('account_id') ?? undefined;
         if (accountId && !accountById(config, accountId)) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown account', retryable: false } });
         const typeParam = url.searchParams.get('type');
@@ -542,7 +612,7 @@ const peers = new Map<string, Peer>();
       }
       const conversationThread = req.method === 'GET' ? url.pathname.match(/^\/api\/conversations\/([^/]+)\/messages$/) : null;
       if (conversationThread) {
-        if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (config.apiToken && !(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const conversationId = decodeURIComponent(conversationThread[1] ?? '');
         if (!conversationId) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'Conversation id is required', retryable: false } });
         const accountId = url.searchParams.get('account_id') ?? undefined;
@@ -557,7 +627,7 @@ const peers = new Map<string, Peer>();
       }
       const contextRoute = url.pathname.match(/^\/api\/messages\/([^/]+)\/context$/);
       if (req.method === 'GET' && contextRoute) {
-        if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (config.apiToken && !(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const messageId = decodeURIComponent(contextRoute[1] ?? '');
         const anchor = await store.get(messageId);
         if (!anchor) return respond(res, 404, { error: { code: 'NOT_FOUND', message: 'Message not found', retryable: false } });
@@ -612,7 +682,7 @@ const peers = new Map<string, Peer>();
         if(req.method==='DELETE'&&id){const auditDelete={actor:'admin',action:'account.delete',account_id:id,target_type:'account',target_id:id,result:'success' as const};try{const removed=await accountStore.remove(id);if(!removed){if(auditStore)await auditStore.record({...auditDelete,result:'failure',metadata:{error:'Account not found'}});return respond(res,404,{error:{code:'NOT_FOUND',message:'Account not found',retryable:false}});}if(auditStore)await auditStore.record(auditDelete);}catch(error){if(auditStore)await auditStore.record({...auditDelete,result:'failure',metadata:{error:error instanceof Error?error.message:'Delete failed'}});return respond(res,500,{error:{code:'PERSISTENCE_ERROR',message:'Could not persist account deletion',retryable:true}});}const index=config.accounts.findIndex(a=>a.id===id);if(index>=0)config.accounts.splice(index,1);const peer=peers.get(id);if(peer){peer.socket.close();peers.delete(id);}return respond(res,200,{deleted:true});}
       }
         if (req.method === 'GET' && url.pathname === '/api/admin/priority') {
-          if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, {error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
+          if (!(await requestIsAuthorized(req))) return respond(res, 401, {error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});
           return respond(res,200,await priorityStore.list());
         }
         const rulePath=url.pathname.match(/^\/api\/admin\/priority\/rules(?:\/([^/]+))?$/);
@@ -637,7 +707,7 @@ const peers = new Map<string, Peer>();
         }
 
       if (url.pathname === '/api/admin/idempotency/reconciliation' || url.pathname.startsWith('/api/admin/idempotency/reconciliation/')) {
-        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const reconciliation = options.idempotencyReconciliation ?? (pool ? new (await import('./idempotency-reconciliation-storage.js')).PostgresIdempotencyReconciliationStorage(pool) : undefined);
         if (!reconciliation) return respond(res, 503, { error: { code: 'IDEMPOTENCY_UNAVAILABLE', message: 'Durable idempotency reconciliation requires database configuration', retryable: false }, automaticRetry: false });
         if (req.method === 'GET' && url.pathname === '/api/admin/idempotency/reconciliation') {
@@ -696,7 +766,7 @@ const peers = new Map<string, Peer>();
         try{return respond(res,200,{deliveries:await notificationDeliveryStore.list(limit)});}catch{return respond(res,500,{error:{code:'PERSISTENCE_ERROR',message:'Could not read notification delivery history',retryable:true}});}
       }
       if (url.pathname === '/api/admin/inbox-rules' && (req.method === 'GET' || req.method === 'PUT')) {
-        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         if (req.method === 'GET') return respond(res, 200, { rules: await inboxRulesStore.get() });
         try {
           const body = await readBody(req, config.maxMessageBytes);
@@ -735,7 +805,7 @@ const peers = new Map<string, Peer>();
       if (req.method === 'POST' && url.pathname === '/api/admin/notifications/test') { if(!safeTokenEqual(config.apiToken,bearer(req)))return respond(res,401,{error:{code:'AUTHENTICATION_ERROR',message:'Unauthorized',retryable:false}});const value=await notificationStore.get();if(!value.enabled||!value.webhookUrl||!value.webhookSecret)return respond(res,409,{error:{code:'NOTIFICATION_CONFIG_INCOMPLETE',message:'Enable notifications and configure URL/secret',retryable:false}});try{await new HermesWebhookNotifier({url:value.webhookUrl,secret:value.webhookSecret,timeoutMs:value.timeoutMs}).notify({event:'test',account:'admin-console',message_id:null,priority:value.minPriority,sender:'',conversation:'',preview:'',reason:'Admin notification test'});if(auditStore)await auditStore.record({actor:'admin',action:'notification.test',target_type:'notification',target_id:'webhook',result:'success'});return respond(res,200,{sent:true});}catch(error){if(auditStore)await auditStore.record({actor:'admin',action:'notification.test',target_type:'notification',target_id:'webhook',result:'failure',metadata:{error:error instanceof Error?error.message:'Delivery failed'}});return respond(res,502,{error:{code:'NOTIFICATION_TEST_FAILED',message:error instanceof Error?error.message:'Delivery failed',retryable:false}});} }
       const contactPath = url.pathname.match(/^\/api\/admin\/accounts\/([^/]+)\/contacts(?:\/(friends|groups|members|search|sync-friends|sync-groups|sync-members))?$/);
       if (contactPath) {
-        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const account = accountById(config, decodeURIComponent(contactPath[1]!));
         if (!account) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown account', retryable: false } });
         try {
@@ -765,7 +835,7 @@ const peers = new Map<string, Peer>();
         }
       }
       if (req.method === 'GET' && url.pathname === '/api/admin/provider-capabilities') {
-        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const providers = [...new Set(config.accounts.map(account => account.provider.trim().toLowerCase()))].sort();
         const capabilities = providers.map(provider => {
           const registered = getProviderCapabilities(provider);
@@ -774,7 +844,7 @@ const peers = new Map<string, Peer>();
         return respond(res, 200, { verification: 'declarations_only', capabilities });
       }
       if (url.pathname.startsWith('/api/admin/provider-qualification')) {
-        if (!safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         if (req.method === 'GET' && url.pathname === '/api/admin/provider-qualification/checklist') return respond(res, 200, { checklist: PROVIDER_QUALIFICATION_CHECKLIST });
         const match = url.pathname.match(/^\/api\/admin\/provider-qualification\/([^/]+)\/([^/]+)$/);
         if (req.method === 'GET' && match) {
@@ -812,7 +882,7 @@ const peers = new Map<string, Peer>();
         }
       }
       if (req.method === 'GET' && url.pathname === '/api/summary') {
-        if (config.apiToken && !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (config.apiToken && !(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const accountId = url.searchParams.get('account_id') ?? undefined;
         if (accountId && !accountById(config, accountId)) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Unknown account', retryable: false } });
         const summary = await store.summary(accountId, url.searchParams.get('since') ?? undefined);
@@ -820,12 +890,12 @@ const peers = new Map<string, Peer>();
         return respond(res, 200, { ...summary, accounts: config.accounts.map(({ access_token: _secret, ...account }) => ({ ...account, connected: connections.some(connection => connection.account_id === account.id && connection.connected) })), connections, uptime_seconds: Math.floor(process.uptime()), database: pool ? 'connected' : 'not_configured', counters: { ingested: eventCount, duplicates: duplicateCount, sends_succeeded: sendSuccess, sends_failed: sendFailure } });
       }
       if (req.method === 'POST' && url.pathname === '/api/messages/mark_seen_all') {
-        if (!config.apiToken || !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!config.apiToken || !(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const updated = await store.markAllSeen();
         return respond(res, 200, { updated, scope: 'all incoming messages', qq_read: false, processed: false });
       }
       if (req.method === 'POST' && (url.pathname === '/api/messages/mark_processed' || url.pathname === '/api/messages/dismiss')) {
-        if (!config.apiToken || !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!config.apiToken || !(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const body = await readBody(req, config.maxMessageBytes) as Record<string, unknown>;
         const id = typeof body.message_id === 'string' ? body.message_id : '';
         if (!id) return respond(res, 400, { error: { code: 'VALIDATION_ERROR', message: 'message_id is required', retryable: false } });
@@ -834,7 +904,7 @@ const peers = new Map<string, Peer>();
         return state ? respond(res, 200, { state }) : respond(res, 404, { error: { code: 'MESSAGE_NOT_FOUND', message: 'Unknown message', retryable: false } });
       }
   if (req.method === 'POST' && url.pathname === '/api/messages/revoke') {
-        if (!config.apiToken || !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!config.apiToken || !(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const body = await readBody(req, config.maxMessageBytes) as Record<string, unknown>;
         const account = accountById(config, String(body.account_id ?? ''));
         if (!account) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Explicit enabled account is required', retryable: false } });
@@ -860,7 +930,7 @@ const peers = new Map<string, Peer>();
         }
       }
       if (req.method === 'POST' && url.pathname === '/api/messages/send') {
-        if (!config.apiToken || !safeTokenEqual(config.apiToken, bearer(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
+        if (!config.apiToken || !(await requestIsAuthorized(req))) return respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } });
         const body = await readBody(req, config.maxMessageBytes) as Record<string, unknown>;
         const account = accountById(config, String(body.account_id ?? ''));
         if (!account) return respond(res, 404, { error: { code: 'ACCOUNT_NOT_FOUND', message: 'Explicit enabled account is required', retryable: false } });
@@ -958,11 +1028,11 @@ const peers = new Map<string, Peer>();
   const mcp = createMcpService(config, store, contactsStore, { allowedRoots: (process.env.ATTACHMENT_ALLOWED_ROOTS??'').split(path.delimiter).filter(Boolean), maxBytes: attachmentMaxBytes, resolveAccount: accountId => { const account = accountById(config, accountId); return account && attachmentActionUrlHostAllowed(account, process.env.ATTACHMENT_ACTION_URL_ALLOWED_HOSTS) ? { permission: account.permission, retrieve: createOneBotFileRetriever(onebot, account) } : undefined; } }, undefined, undefined, mcpDataTools);
 
   server.removeAllListeners('request');
-  server.on('request', (req, res) => {
+  server.on('request', async (req, res) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     if (url.pathname === '/mcp') {
       if (req.method !== 'POST') { respond(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Use MCP POST', retryable: false } }); return; }
-      if (!safeTokenEqual(config.apiToken, bearer(req))) { respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } }); return; }
+      if (!(await requestIsAuthorized(req))) { respond(res, 401, { error: { code: 'AUTHENTICATION_ERROR', message: 'Unauthorized', retryable: false } }); return; }
       // Stateless mode: a fresh server+transport pair per request, as the SDK requires.
       const { server: requestServer, transport } = mcp.createHttpSession();
       res.once('close', () => { void transport.close().catch(() => {}); });

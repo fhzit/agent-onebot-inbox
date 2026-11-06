@@ -18,6 +18,9 @@ export type AppConfig = {
   accounts: AccountConfig[];
   adminBasePath: string;
   providerEventToken?: string;
+  /** Console password; intentionally separate from apiToken. Empty disables console login. */
+  adminPassword?: string;
+  adminSessionSecret?: string;
 };
 
 function parseBool(value: string | undefined, fallback: boolean): boolean {
@@ -78,5 +81,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     accounts,
     adminBasePath: (() => { const value = (env.ADMIN_BASE_PATH ?? '/admin').replace(/\/$/, ''); if (!/^\/[a-zA-Z0-9/_-]*$/.test(value) || value === '/') throw new Error('ADMIN_BASE_PATH must be a non-root path'); return value; })(),
     ...(env.ONEBOT_EVENT_TOKEN !== undefined ? { providerEventToken: env.ONEBOT_EVENT_TOKEN } : {}),
+    ...(env.ADMIN_PASSWORD !== undefined ? { adminPassword: env.ADMIN_PASSWORD } : {}),
+    ...(env.ADMIN_SESSION_SECRET !== undefined ? { adminSessionSecret: env.ADMIN_SESSION_SECRET } : {}),
   };
 }
