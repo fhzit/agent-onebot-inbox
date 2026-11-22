@@ -41,7 +41,9 @@
     "@modelcontextprotocol/sdk": {
       "express": "^5.3.0",
       "express-rate-limit": "^8.7.1",
-      "body-parser": "^2.4.0"
+      "body-parser": "^2.4.0",
+      "hono": "^4.13.19",
+      "@hono/node-server": "^2.1.11"
     }
   }
 }
