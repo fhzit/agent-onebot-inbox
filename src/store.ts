@@ -96,6 +96,21 @@ export class MessageStore {
   }
   markSeen(id: string): InboxState | undefined { return this.updateState(id, { seen_by_agent: true }); }
   markAllSeen(): number { let updated=0; for (const message of this.#byId.values()) if(message.direction==='incoming'&&this.state(message.id)?.unread){this.updateState(message.id,{seen_by_agent:true});updated++;} return updated; }
+  /**
+   * 本账号在某会话发出消息后，把该会话中该时刻之前的入站消息视为已读。
+   * OneBot v11 不提供“用户已读”事件，这是最接近 QQ 侧已读的可用信号。
+   */
+  markConversationSeen(conversationId: string, upToIso: string): number {
+    let updated = 0;
+    for (const message of this.#byId.values()) {
+      if (message.direction !== 'incoming' || message.conversation_id !== conversationId) continue;
+      if (message.sent_at > upToIso) continue;
+      if (!this.state(message.id)?.unread) continue;
+      this.updateState(message.id, { seen_by_agent: true });
+      updated++;
+    }
+    return updated;
+  }
   markProcessed(id: string): InboxState | undefined { return this.updateState(id, { seen_by_agent: true, processed: true }); }
   dismiss(id: string): InboxState | undefined { return this.updateState(id, { seen_by_agent: true, dismissed: true }); }
   private updateState(id: string, update: Partial<Omit<InboxState, 'unread' | 'qq_read'>>): InboxState | undefined {

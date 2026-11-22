@@ -253,6 +253,29 @@ function validateAttachmentActionUrlHosts(accounts: readonly AccountConfig[], ra
     if (!attachmentActionUrlHostAllowed(account, raw)) throw new Error(`Account ${account.id} action_url host must be included in ATTACHMENT_ACTION_URL_ALLOWED_HOSTS`);
   }
 }
+/**
+ * 本账号在某个会话里发出消息（来自 QQ 客户端的 message_sent 同步）后，
+ * 把该会话中更早的入站消息视为已读。
+ *
+ * OneBot v11 没有“用户已读”事件，QQ 群聊本身也不存在成员级已读状态，
+ * 所以“本人在该会话发过言”是最接近的真实信号。
+ */
+export async function markConversationReadAfterOutgoing(
+  store: Pick<MessageStore, 'markConversationSeen'> | Pick<PostgresMessageStore, 'markConversationSeen'>,
+  message: NormalizedMessage,
+  logger: { info: (context: Record<string, unknown>, message: string) => void; warn: (context: Record<string, unknown>, message: string) => void },
+): Promise<number> {
+  if (message.direction !== 'outgoing') return 0;
+  try {
+    const updated = await store.markConversationSeen(message.conversation_id, message.sent_at);
+    if (updated > 0) logger.info({ account_id: message.account_id, conversation_id: message.conversation_id, updated }, 'conversation marked read after outgoing message');
+    return updated;
+  } catch (error) {
+    logger.warn({ account_id: message.account_id, error: error instanceof Error ? error.message : 'unknown' }, 'failed to mark conversation read after outgoing message');
+    return 0;
+  }
+}
+
 export async function startServer(config: AppConfig, store?: MessageStore | PostgresMessageStore, priorityConfig: PriorityConfig = { rules: [], watchPeople: [] }, options: { requireDatabase?: boolean; databaseUrl?: string; accountEncryptionKey?: string; accountStore?: Pick<AccountStore, 'loadConfiguredAccounts'|'create'>; inboxRules?: readonly InboxRule[]; notificationDigest?: { enabled: boolean; intervalMs?: number; batchSize?: number }; aiClassification?: { enabled: true; policy: ClassificationIngressOptions; classifier: MessageClassifier }; aiAdvisories?: { enabled: true; accountIds: readonly string[]; model: string; policyVersion: string; policy: ClassificationIngressOptions; classifier: MessageClassifier; store?: Pick<PostgresAiAdvisoryStore, 'record' | 'list'>; consent?: Pick<import('./ai-advisory-consent.js').AiAdvisoryConsentService, 'query'>; }; aiAdvisoryRetention?: unknown; testAiAdvisoryRetentionRepository?: AiAdvisoryRetentionRepository; testAiAdvisoryRetentionTransaction?: AiAdvisoryRetentionTransactionRunner; historyReconciliation?: { service: (request: HistoryReconciliationRequest) => Promise<unknown>; maxBodyBytes?: number }; idempotencyReconciliation?: Pick<PostgresIdempotencyReconciliationStorage, 'listPending' | 'adjudicate' | 'listAdjudications'>; testAiAdvisoryDependencies?: true } = {}): Promise<Runtime> {
   if(options.requireDatabase&&!options.databaseUrl)throw new Error('DATABASE_URL is required for durable runtime');
   const attachmentMaxBytes = parseAttachmentMaxBytes(process.env.ATTACHMENT_MAX_BYTES);
@@ -557,6 +580,7 @@ const peers = new Map<string, Peer>();
         if (!message) return respond(res, 200, { status: 'ignored' });
         const result = await store.insert(message);
         if (result.inserted) {
+          await markConversationReadAfterOutgoing(store, result.message, logger);
         try {
             await classifyIncomingMessage(message, options.aiClassification?.policy, options.aiClassification?.classifier);
           } catch (error) {
@@ -1103,6 +1127,7 @@ const peers = new Map<string, Peer>();
       if (!message) return;
       const result = await store.insert(message);
       if (result.inserted) {
+        await markConversationReadAfterOutgoing(store, result.message, logger);
         try {
           await classifyIncomingMessage(message, options.aiClassification?.policy, options.aiClassification?.classifier);
         } catch (error) {
